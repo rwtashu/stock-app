@@ -1,15 +1,19 @@
-""" Stock Analyzer v3 - TradingView-style chart (scroll / pinch zoom / timeframes) - Auto chart patterns drawn on chart (+ explanation and expected move) - Long / Short position tool (Entry, Stop-loss, Targets) drawn on chart - Watchlist (saved in the page URL), search incl. new listings Run locally: streamlit run stock_analyzer.py Educational tool only. Not financial advice. """
+""" Stock Analyzer v4 - Native Plotly chart (finger scroll / pinch zoom / timeframes) + LIVE auto-refresh - Auto chart patterns drawn on chart (+ explanation and expected move) - Long / Short position tool (Entry, Stop-loss, Targets) drawn on chart - Watchlist (saved in the page URL), search incl. new listings Run locally: streamlit run stock_analyzer.py Educational tool only. Not financial advice. """
 import html
-import json
+import inspect
 import math
 import re
+import time
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 import yfinance as yf
+from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Stock Analyzer", page_icon="📈", layout="wide")
 st.markdown(
@@ -42,9 +46,47 @@ def f2(x):
     return round(float(x), 2)
 
 
+# ------------------------------------------------------------------ live / market helpers
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def ist_now():
+    return datetime.now(IST)
+
+
+def is_indian(sym):
+    return sym.endswith((".NS", ".BO")) or sym.startswith(("^NSE", "^BSE", "^CNX"))
+
+
+def market_open(sym):
+    """Rough 'is the market trading now' check (holidays are not known)."""
+    now = ist_now()
+    mins, wd = now.hour * 60 + now.minute, now.weekday()
+    if sym.endswith(("-USD", "=X")):  # crypto / forex
+        return True
+    if is_indian(sym):
+        return wd < 5 and 9 * 60 + 15 <= mins <= 15 * 60 + 35
+    # US-like hours (about 19:00 - 02:45 IST)
+    return (wd <= 4 and mins >= 18 * 60 + 45) or (1 <= wd <= 5 and mins <= 2 * 60 + 45)
+
+
+def stretch_kw(fn):
+    """Full-width kwargs that work on both old and new Streamlit versions."""
+    try:
+        params = inspect.signature(fn).parameters
+    except Exception:
+        return {}
+    if "width" in params:
+        return {"width": "stretch"}
+    if "use_container_width" in params:
+        return {"use_container_width": True}
+    return {}
+
+
 # ------------------------------------------------------------------ data
-@st.cache_data(ttl=300, show_spinner=False)
-def load(sym, interval, period):
+@st.cache_data(ttl=900, show_spinner=False, max_entries=300)
+def load(sym, interval, period, bucket=0):
+    """`bucket` only changes the cache key, so data is re-fetched when the bucket (time slot) changes."""
     try:
         df = yf.download(sym, interval=interval, period=period,
                          auto_adjust=True, progress=False, threads=False)
@@ -59,6 +101,30 @@ def load(sym, interval, period):
     except Exception:
         return pd.DataFrame()
     return df[~df.index.duplicated(keep="last")]
+
+
+def load_live(sym, interval, period, bucket):
+    """Like load(), but falls back to the last good data if Yahoo fails. Returns (df, is_stale)."""
+    df = load(sym, interval, period, bucket)
+    store = st.session_state.setdefault("last_good", {})
+    key = f"{sym}|{interval}|{period}"
+    if df is None or df.empty:
+        old = store.get(key)
+        return (old, True) if old is not None else (pd.DataFrame(), False)
+    store[key] = df
+    while len(store) > 14:
+        store.pop(next(iter(store)))
+    return df, False
+
+
+def last_bar_ist(df):
+    if df is None or df.empty:
+        return None
+    ts = df.index[-1]
+    try:
+        return ts.astimezone(IST) if ts.tzinfo is not None else ts.replace(tzinfo=IST)
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -583,11 +649,11 @@ def analyze(df, intraday, cfg, daily_atr, rr, capital, risk_pct):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def scan_one(sym, rr, capital, risk_pct):
-    d = load(sym, "1d", "2y")
+def scan_one(sym, rr, capital, risk_pct, bucket=0):
+    d = load(sym, "1d", "2y", bucket)
     if d.empty or len(d) < 2:
         return None
-    i = load(sym, "5m", "5d")
+    i = load(sym, "5m", "5d", bucket)
     datr = float(true_range(d).ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
     ls_ = analyze(d, False, CFG_LONG, datr, rr, capital, risk_pct)
     is_ = analyze(i, True, CFG_INTRA, datr, rr, capital, risk_pct)
@@ -600,27 +666,26 @@ def scan_one(sym, rr, capital, risk_pct):
     )
 
 
-# ------------------------------------------------------------------ chart (TradingView lightweight-charts)
-def to_times(idx, daily):
-    if daily:
-        return list(idx.strftime("%Y-%m-%d"))
-    naive = idx.tz_localize(None) if idx.tz is not None else idx
-    secs = (naive - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
-    return [int(x) for x in secs]
+# ------------------------------------------------------------------ chart (Plotly, runs natively inside Streamlit)
+PLOT_CONFIG = dict(
+    scrollZoom=True, displaylogo=False, doubleClick="reset", responsive=True,
+    modeBarButtonsToRemove=["select2d", "lasso2d"],
+)
+GREEN_A, RED_A = "rgba(38,166,154,0.55)", "rgba(239,83,80,0.55)"
+LABEL_FMT = {"1D": "%d %b %y", "1W": "%d %b %y", "1M": "%b %Y"}
 
 
-def line_series(times, series, color, name, width=1):
-    data = [{"time": t, "value": round(float(v), 2)} for t, v in zip(times, series.tolist()) if not pd.isna(v)]
-    return {"name": name, "color": color, "width": width, "data": data}
+def make_labels(idx, tf):
+    fmt = LABEL_FMT.get(tf, "%d %b %H:%M")
+    return [str(x) for x in idx.strftime(fmt)]
 
 
-CHART_HTML = """ <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0e1117;border-radius:8px;padding:6px"> <div id="legend" style="color:#d1d4dc;font-size:13px;padding:4px 6px;min-height:56px;line-height:1.5"></div> <div id="wrap" style="position:relative;width:100%"> <div id="chart" style="width:100%;height:500px"></div> <canvas id="ov" style="position:absolute;left:0;top:0;pointer-events:none"></canvas> </div> <div style="display:flex;gap:8px;padding:8px 4px 2px 4px;flex-wrap:wrap"> <button class="b" onclick="zoom(0.65)">＋ Zoom in</button> <button class="b" onclick="zoom(1.5)">－ Zoom out</button> <button class="b" onclick="fitAll()">Fit all</button> <button class="b" onclick="latest()">Latest ▶</button> </div> </div> <style>.b{background:#1f2430;color:#d1d4dc;border:1px solid #2a2e39;border-radius:6px;padding:7px 12px;font-size:13px;cursor:pointer}.b:active{background:#2a2e39}</style> <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script> <script> const D = __DATA__; const el = document.getElementById('chart'); const ov = document.getElementById('ov'); const legend = document.getElementById('legend'); const H = 500; function zoom() {} function fitAll() {} function latest() {} if (typeof LightweightCharts === 'undefined') { el.innerHTML = '<div style="color:#ef5350;padding:20px">Chart library load nahi hui. Internet check karke page refresh karo.</div>'; } else { const n = D.candles.length; const P = D.pos; const chart = LightweightCharts.createChart(el, { width: el.clientWidth, height: H, layout: { background: { type: 'solid', color: '#0e1117' }, textColor: '#d1d4dc' }, grid: { vertLines: { color: '#1b1f2b' }, horzLines: { color: '#1b1f2b' } }, crosshair: { mode: LightweightCharts.CrosshairMode.Normal }, rightPriceScale: { borderColor: '#2a2e39' }, timeScale: { borderColor: '#2a2e39', timeVisible: D.intraday, secondsVisible: false, rightOffset: 6 }, handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false }, handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true }, localization: { priceFormatter: p => p.toFixed(2) } }); const candles = chart.addCandlestickSeries({ upColor: '#26a69a', downColor: '#ef5350', borderVisible: false, wickUpColor: '#26a69a', wickDownColor: '#ef5350', autoscaleInfoProvider: (orig) => { const r = orig(); if (!r || !P) return r; try { const vr = chart.timeScale().getVisibleLogicalRange(); if (vr && vr.to >= n - 1) { r.priceRange.minPrice = Math.min(r.priceRange.minPrice, P.lo); r.priceRange.maxPrice = Math.max(r.priceRange.maxPrice, P.hi); } } catch (e) {} return r; } }); candles.setData(D.candles); if (D.volume.length) { const vol = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: '' }); vol.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } }); vol.setData(D.volume); } (D.lines || []).forEach(l => { const s = chart.addLineSeries({ color: l.color, lineWidth: l.width, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); s.setData(l.data); }); (D.segs || []).forEach(sg => { const t1 = D.candles[sg.i1], t2 = D.candles[sg.i2]; if (!t1 || !t2 || sg.i2 <= sg.i1) return; const s = chart.addLineSeries({ color: sg.color, lineWidth: 2, lineStyle: sg.dash ? 2 : 0, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }); s.setData([{ time: t1.time, value: sg.p1 }, { time: t2.time, value: sg.p2 }]); }); (D.levels || []).forEach(l => { candles.createPriceLine({ price: l.price, color: l.color, lineWidth: 1, lineStyle: l.style, axisLabelVisible: true, title: l.title }); }); if ((D.markers || []).length) { const mk = D.markers.filter(m => D.candles[m.i]).map(m => ({ time: D.candles[m.i].time, position: m.pos, color: m.color, shape: m.shape, text: m.text, size: 1 })); mk.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0)); candles.setMarkers(mk); } const f = v => (+v).toFixed(2); const fmt = v => (+v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); const pct = (a, b) => ((a / b - 1) * 100); const patLine = (D.patnames && D.patnames.length) ? '<br><span style="color:#ffb300">▣ ' + D.patnames.join(' · ') + '</span>' : ''; function setLegend(c) { if (!c) return; const col = c.close >= c.open ? '#26a69a' : '#ef5350'; legend.innerHTML = '<b style="font-size:15px;color:#fff">' + D.title + '</b> <span style="color:#9aa0a6">· ' + D.tf + '</span><br>' + 'O <span style="color:' + col + '">' + f(c.open) + '</span> &nbsp;H <span style="color:' + col + '">' + f(c.high) + '</span> &nbsp;L <span style="color:' + col + '">' + f(c.low) + '</span> &nbsp;C <span style="color:' + col + '">' + f(c.close) + '</span>' + patLine; } const lastBar = D.candles[n - 1]; setLegend(lastBar); chart.subscribeCrosshairMove(p => { const c = p && p.seriesData ? p.seriesData.get(candles) : null; setLegend(c || lastBar); }); const ext = P ? P.bars + 4 : 8; chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - 110), to: n + ext }); // ---------- overlay canvas: position tool + pattern labels const dpr = window.devicePixelRatio || 1; let sig = ''; function sizeCv() { const w = el.clientWidth; ov.width = Math.round(w * dpr); ov.height = Math.round(H * dpr); ov.style.width = w + 'px'; ov.style.height = H + 'px'; sig = ''; } function priceW() { try { return chart.priceScale('right').width(); } catch (e) { return 56; } } function box(ctx, x, y, w, h, color) { ctx.fillStyle = color; ctx.fillRect(x, y, w, h); } function hline(ctx, x1, x2, y, color, dash, lw) { ctx.strokeStyle = color; ctx.lineWidth = lw || 1; ctx.setLineDash(dash ? [5, 4] : []); ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y); ctx.stroke(); ctx.setLineDash([]); } function text(ctx, s, x, y, color, bold) { ctx.font = (bold ? 'bold ' : '') + '11px -apple-system,Segoe UI,Roboto,sans-serif'; const w = ctx.measureText(s).width; ctx.fillStyle = 'rgba(14,17,23,0.72)'; ctx.fillRect(x - 2, y - 11, w + 4, 14); ctx.fillStyle = color; ctx.fillText(s, x, y); } function draw() { const w = el.clientWidth; const ctx = ov.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, H); const ts = chart.timeScale(); const maxX = w - priceW(); ctx.save(); ctx.beginPath(); ctx.rect(0, 0, maxX, H - 28); ctx.clip(); if (P) { const x1 = ts.logicalToCoordinate(n - 1), x2 = ts.logicalToCoordinate(n - 1 + P.bars); const yE = candles.priceToCoordinate(P.entry), yS = candles.priceToCoordinate(P.sl); const y1 = candles.priceToCoordinate(P.t1), y2 = candles.priceToCoordinate(P.t2); if ([x1, x2, yE, yS, y1, y2].every(v => v !== null && isFinite(v))) { const wd = Math.max(x2 - x1, 20); box(ctx, x1, Math.min(yE, y2), wd, Math.abs(y2 - yE), 'rgba(38,166,154,0.20)'); box(ctx, x1, Math.min(yE, yS), wd, Math.abs(yS - yE), 'rgba(239,83,80,0.22)'); hline(ctx, x1, x1 + wd, y2, '#26a69a', false, 1.5); hline(ctx, x1, x1 + wd, y1, '#26a69a', true, 1); hline(ctx, x1, x1 + wd, yE, '#42a5f5', false, 1.5); hline(ctx, x1, x1 + wd, yS, '#ef5350', false, 1.5); const lx = Math.max(x1 + 6, 4); const sgn = P.side === 'BUY' ? 1 : -1; text(ctx, 'T2 ' + fmt(P.t2) + ' (' + (pct(P.t2, P.entry)).toFixed(2) + '%)', lx, y2 + (sgn > 0 ? -5 : 14), '#26a69a', true); text(ctx, 'T1 ' + fmt(P.t1) + ' (' + (pct(P.t1, P.entry)).toFixed(2) + '%)', lx, y1 + (sgn > 0 ? -5 : 14), '#26a69a', false); text(ctx, (P.side === 'BUY' ? 'LONG' : 'SHORT') + ' Entry ' + fmt(P.entry) + ' R:R 1:' + P.rr, lx, yE + (sgn > 0 ? -5 : 14), '#42a5f5', true); text(ctx, 'SL ' + fmt(P.sl) + ' (' + (pct(P.sl, P.entry)).toFixed(2) + '%)', lx, yS + (sgn > 0 ? 14 : -5), '#ef5350', true); if (P.note) text(ctx, P.note, lx, Math.min(yS, y2) - 18, '#ffb300', false); } } (D.labels || []).forEach(lb => { const x = ts.logicalToCoordinate(lb.i), y = candles.priceToCoordinate(lb.p); if (x !== null && y !== null && isFinite(x) && isFinite(y)) text(ctx, lb.text, x, y, lb.color, true); }); ctx.restore(); } function loop() { const ts = chart.timeScale(); const ref = lastBar.close; const key = [el.clientWidth, ts.logicalToCoordinate(n - 1), ts.logicalToCoordinate(n + 10), candles.priceToCoordinate(ref), candles.priceToCoordinate(ref * 1.1), priceW()].join('|'); if (key !== sig) { sig = key; draw(); } requestAnimationFrame(loop); } sizeCv(); requestAnimationFrame(loop); window.zoom = function (factor) { const ts = chart.timeScale(); const r = ts.getVisibleLogicalRange(); if (!r) return; const mid = (r.from + r.to) / 2, half = (r.to - r.from) / 2 * factor; ts.setVisibleLogicalRange({ from: mid - half, to: mid + half }); }; window.fitAll = function () { chart.timeScale().fitContent(); }; window.latest = function () { chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - 110), to: n + ext }); }; window.chart = chart; window.addEventListener('resize', () => { chart.applyOptions({ width: el.clientWidth }); sizeCv(); }); } </script> """
-
-
-def _json_default(o):
-    if isinstance(o, (np.floating, np.integer)):
-        return float(o)
-    return str(o)
+def prep_chart_df(df, tf):
+    """The category x-axis needs unique labels, so drop candles whose label repeats."""
+    if df is None or df.empty:
+        return df
+    labs = pd.Series(make_labels(df.index, tf), index=df.index)
+    return df[~labs.duplicated(keep="last").to_numpy()]
 
 
 def pick_plan(sig, pos_mode):
@@ -637,68 +702,168 @@ def pick_plan(sig, pos_mode):
     return sig["plans"][side], "Signal WAIT: sirf reference plan"
 
 
-def render_chart(df, tf, title, overlays, sig, pos_mode, pat_list):
-    daily = tf not in INTRADAY_TF
-    times = to_times(df.index, daily)
+def build_figure(df, tf, name, symbol, overlays, sig, pos_mode, pat_list, view, rev):
     n = len(df)
-    o, h, l, c, v = (df[k].tolist() for k in ["Open", "High", "Low", "Close", "Volume"])
-    candles = [
-        {"time": t, "open": round(a, 2), "high": round(b, 2), "low": round(d, 2), "close": round(e, 2)}
-        for t, a, b, d, e in zip(times, o, h, l, c)
-    ]
-    volume = []
-    if "Volume" in overlays and any(x > 0 for x in v):
-        volume = [
-            {"time": t, "value": float(x),
-             "color": "rgba(38,166,154,0.45)" if e >= a else "rgba(239,83,80,0.45)"}
-            for t, x, a, e in zip(times, v, o, c)
-        ]
-    lines = []
+    daily = tf not in INTRADAY_TF
+    labs = make_labels(df.index, tf)
+    o = df["Open"].to_numpy(float)
+    h = df["High"].to_numpy(float)
+    l = df["Low"].to_numpy(float)
+    c = df["Close"].to_numpy(float)
+    v = df["Volume"].to_numpy(float)
+    atr_c = float(true_range(df).ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+    if not atr_c > 0:
+        atr_c = float(np.nanmean(h - l))
+    if not atr_c > 0:
+        atr_c = 1.0
+
+    has_vol = "Volume" in overlays and float(np.nansum(v)) > 0
+    rows = 2 if has_vol else 1
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.02,
+                        row_heights=[0.8, 0.2] if has_vol else [1.0])
+
+    fig.add_trace(go.Candlestick(
+        x=labs, open=o, high=h, low=l, close=c, name="Price", showlegend=False,
+        increasing_line_color=GREEN, decreasing_line_color=RED,
+        increasing_fillcolor=GREEN, decreasing_fillcolor=RED), row=1, col=1)
+
+    s_close = df["Close"]
     if "EMA 20/50" in overlays:
-        lines.append(line_series(times, df["Close"].ewm(span=20, adjust=False).mean(), "#2962ff", "EMA20"))
+        fig.add_trace(go.Scatter(x=labs, y=s_close.ewm(span=20, adjust=False).mean().round(2), mode="lines",
+                                 name="EMA 20", line=dict(color="#2962ff", width=1.3), hoverinfo="skip"),
+                      row=1, col=1)
         if n >= 60:
-            lines.append(line_series(times, df["Close"].ewm(span=50, adjust=False).mean(), "#ff9800", "EMA50"))
+            fig.add_trace(go.Scatter(x=labs, y=s_close.ewm(span=50, adjust=False).mean().round(2), mode="lines",
+                                     name="EMA 50", line=dict(color="#ff9800", width=1.3), hoverinfo="skip"),
+                          row=1, col=1)
     if "VWAP" in overlays and not daily:
-        lines.append(line_series(times, vwap(df), "#ab47bc", "VWAP"))
+        fig.add_trace(go.Scatter(x=labs, y=vwap(df).round(2), mode="lines", name="VWAP",
+                                 line=dict(color="#ab47bc", width=1.3, dash="dot"), hoverinfo="skip"),
+                      row=1, col=1)
+    if has_vol:
+        vcol = [GREEN_A if cc >= oo else RED_A for oo, cc in zip(o, c)]
+        fig.add_trace(go.Bar(x=labs, y=v, marker_color=vcol, name="Volume", showlegend=False), row=2, col=1)
 
-    levels = []
+    # ---- support / resistance, last price line
     if sig and "Support/Resistance" in overlays:
-        levels.append(dict(price=f2(sig["support"]), color=GREEN, style=2, title="Support"))
-        levels.append(dict(price=f2(sig["resistance"]), color=RED, style=2, title="Resistance"))
+        fig.add_hline(y=f2(sig["support"]), line_dash="dash", line_color=GREEN, line_width=1,
+                      annotation_text="Support", annotation_position="bottom right",
+                      annotation_font_color=GREEN, annotation_font_size=11, row=1, col=1)
+        fig.add_hline(y=f2(sig["resistance"]), line_dash="dash", line_color=RED, line_width=1,
+                      annotation_text="Resistance", annotation_position="top right",
+                      annotation_font_color=RED, annotation_font_size=11, row=1, col=1)
+    last = float(c[-1])
+    prev = float(c[-2]) if n > 1 else last
+    lcol = GREEN if last >= prev else RED
+    fig.add_hline(y=f2(last), line_dash="dot", line_color=lcol, line_width=1,
+                  annotation_text=f"{last:,.2f}", annotation_position="top right",
+                  annotation_font_color=lcol, annotation_font_size=12, row=1, col=1)
 
-    segs, markers, labels, patnames = [], [], [], []
-    if "Chart patterns" in overlays:
-        for p in pat_list[:3]:
-            patnames.append(f"{p['name']} ({p['status']})")
-            segs += [s for s in p["lines"] if 0 <= s["i1"] < n and 0 <= s["i2"] < n]
-            markers += [m for m in p["markers"] if 0 <= m["i"] < n]
-            if 0 <= p["label"]["i"] < n:
-                labels.append(p["label"])
+    # ---- chart patterns + candle patterns
+    groups = {}
+
+    def add_mark(i, pos, text, color, shape):
+        if not (0 <= i < n):
+            return
+        sym = {"arrowUp": "triangle-up", "arrowDown": "triangle-down"}.get(shape, "circle")
+        y = h[i] + 0.35 * atr_c if pos == "aboveBar" else l[i] - 0.35 * atr_c
+        g = groups.setdefault((color, sym, pos), ([], [], []))
+        g[0].append(labs[i])
+        g[1].append(f2(y))
+        g[2].append(text)
+
+    shown = pat_list[:3] if "Chart patterns" in overlays else []
+    for p in shown:
+        for ln in p["lines"]:
+            i1, i2 = int(ln["i1"]), int(ln["i2"])
+            if 0 <= i1 < n and 0 <= i2 < n and i1 != i2:
+                fig.add_trace(go.Scatter(
+                    x=[labs[i1], labs[i2]], y=[ln["p1"], ln["p2"]], mode="lines", showlegend=False,
+                    line=dict(color=ln["color"], width=2, dash="dot" if ln["dash"] else "solid"),
+                    hoverinfo="skip"), row=1, col=1)
+        for m in p["markers"]:
+            add_mark(int(m["i"]), m["pos"], m["text"], m["color"], m["shape"])
+        lb = p["label"]
+        if 0 <= int(lb["i"]) < n:
+            fig.add_annotation(x=labs[int(lb["i"])], y=lb["p"], text="<b>" + html.escape(lb["text"]) + "</b>",
+                               showarrow=False, font=dict(color=lb["color"], size=12),
+                               bgcolor="rgba(14,17,23,0.75)", row=1, col=1)
     if "Candle patterns" in overlays:
         cp = detect_patterns(df).tail(40)
         base = n - len(cp)
         for k, (_, row) in enumerate(cp.iterrows()):
-            for name in BULLISH:
-                if row[name]:
-                    markers.append(dict(i=base + k, pos="belowBar", text=name.replace("Bullish ", ""),
-                                        color=GREEN, shape="arrowUp"))
-            for name in BEARISH:
-                if row[name]:
-                    markers.append(dict(i=base + k, pos="aboveBar", text=name.replace("Bearish ", ""),
-                                        color=RED, shape="arrowDown"))
+            for nm in BULLISH:
+                if row[nm]:
+                    add_mark(base + k, "belowBar", nm.replace("Bullish ", ""), GREEN, "arrowUp")
+            for nm in BEARISH:
+                if row[nm]:
+                    add_mark(base + k, "aboveBar", nm.replace("Bearish ", ""), RED, "arrowDown")
+    for (color, sym, pos), (xs, ys, txt) in groups.items():
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="markers+text", text=txt, showlegend=False, hoverinfo="skip",
+            textposition="top center" if pos == "aboveBar" else "bottom center",
+            textfont=dict(color=color, size=10), marker=dict(symbol=sym, size=9, color=color)),
+            row=1, col=1)
 
-    pos = None
-    if "Position tool" in overlays:
+    # ---- long / short position tool
+    plan, note = (None, None)
+    if sig and "Position tool" in overlays:
         plan, note = pick_plan(sig, pos_mode)
-        if plan:
-            pos = dict(side=plan["side"], entry=f2(plan["entry"]), sl=f2(plan["sl"]), t1=f2(plan["t1"]),
-                       t2=f2(plan["t2"]), rr=plan["rr"], bars=max(12, min(40, n // 6)), note=note,
-                       lo=f2(min(plan["sl"], plan["t2"])), hi=f2(max(plan["sl"], plan["t2"])))
-    payload = dict(title=html.escape(title), tf=tf, intraday=not daily, candles=candles, volume=volume,
-                   lines=lines, levels=levels, segs=segs, markers=markers, labels=labels,
-                   patnames=patnames, pos=pos)
-    page = CHART_HTML.replace("__DATA__", json.dumps(payload, default=_json_default).replace("</", "<\\/"))
-    components.html(page, height=700)
+    box_bars = max(12, min(40, n // 6))
+    vis = n if view == "Sab" else min(int(view), n)
+    lo_v, hi_v = float(np.nanmin(l[-vis:])), float(np.nanmax(h[-vis:]))
+    ext = 6
+    if plan:
+        ext = box_bars + 3
+        lo_v, hi_v = min(lo_v, plan["sl"], plan["t2"]), max(hi_v, plan["sl"], plan["t2"])
+        x0, x1 = n - 1, n - 1 + box_bars
+        sgn = 1 if plan["side"] == "BUY" else -1
+        e, sl_, t1, t2 = (f2(plan[k]) for k in ("entry", "sl", "t1", "t2"))
+
+        def pc(x):
+            return (x / e - 1) * 100 if e else 0.0
+
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=e, y1=t2, fillcolor="rgba(38,166,154,0.22)",
+                      line_width=0, layer="below", row=1, col=1)
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=e, y1=sl_, fillcolor="rgba(239,83,80,0.24)",
+                      line_width=0, layer="below", row=1, col=1)
+        for yv, colr, dash, wd in [(e, BLUE, "solid", 1.6), (sl_, RED, "solid", 1.6),
+                                   (t1, GREEN, "dash", 1.2), (t2, GREEN, "solid", 1.6)]:
+            fig.add_shape(type="line", x0=x0, x1=x1, y0=yv, y1=yv,
+                          line=dict(color=colr, width=wd, dash=dash), row=1, col=1)
+
+        def tag(yv, text, colr, above, left=True):
+            fig.add_annotation(x=(x0 + 0.4) if left else (x1 - 0.4), y=yv, text=text, showarrow=False,
+                               xanchor="left" if left else "right", yanchor="bottom" if above else "top",
+                               font=dict(color=colr, size=11), bgcolor="rgba(14,17,23,0.7)", row=1, col=1)
+
+        tag(t2, f"T2 {t2:,.2f} ({pc(t2):+.2f}%)", GREEN, sgn > 0)
+        tag(t1, f"T1 {t1:,.2f} ({pc(t1):+.2f}%)", GREEN, sgn > 0)
+        tag(e, f"{'LONG' if sgn > 0 else 'SHORT'} Entry {e:,.2f} R:R 1:{plan['rr']:g}", BLUE, True)
+        tag(sl_, f"SL {sl_:,.2f} ({pc(sl_):+.2f}%)", RED, sgn < 0)
+        if note:
+            tag(min(sl_, t2), note, AMBER, False, left=False)
+
+    pad = (hi_v - lo_v) * 0.06 or max(abs(last) * 0.01, 0.01)
+    fig.update_yaxes(range=[lo_v - pad, hi_v + pad], row=1, col=1)
+    fig.update_xaxes(range=[n - vis - 0.5, n - 1 + ext + 0.5])
+
+    title = (f"<b>{html.escape(name)}</b> · {html.escape(symbol)} · {tf}"
+             f" O {o[-1]:,.2f} H {h[-1]:,.2f} L {l[-1]:,.2f} C {c[-1]:,.2f}")
+    fig.update_xaxes(type="category", categoryorder="array", categoryarray=labs, rangeslider_visible=False,
+                     showgrid=False, showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikethickness=1, spikecolor="#8b93a7", spikedash="dot", nticks=8, tickangle=0)
+    fig.update_yaxes(side="right", gridcolor="#1b1f2b", showspikes=True, spikemode="across",
+                     spikethickness=1, spikecolor="#8b93a7", spikedash="dot")
+    if has_vol:
+        fig.update_yaxes(showgrid=False, row=2, col=1)
+    fig.update_layout(
+        template="plotly_dark", height=640 if has_vol else 560, margin=dict(l=6, r=6, t=78, b=6),
+        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", dragmode="pan", hovermode="x", uirevision=rev,
+        title=dict(text=title, x=0.01, xanchor="left", y=0.985, yanchor="top", font=dict(size=14)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=11)),
+    )
+    return fig
 
 
 # ------------------------------------------------------------------ UI helpers
@@ -928,7 +1093,7 @@ with st.expander("⚙️ Settings (capital, risk, target size)"):
     risk_pct = st.slider("Risk per trade (%)", 0.25, 3.0, 1.0, 0.25)
     rr = st.slider("Reward : Risk (Target 1)", 1.0, 4.0, 2.0, 0.5,
                    help="2.0 matlab Target 1 stop-loss se 2 guna door, Target 2 us se 3 guna door.")
-    if st.button("🔄 Data refresh"):
+    if st.button("🔄 Abhi refresh karo (cache saaf)"):
         st.cache_data.clear()
         st.rerun()
 
@@ -938,7 +1103,7 @@ if page == PAGE_WL:
     ic1, ic2 = st.columns([4, 1])
     ic1.text_input("Symbol add karo", key="wl_input", placeholder="Symbol (jaise TCS, IRCTC.NS, ^NSEI)",
                    label_visibility="collapsed")
-    ic2.button("➕ Add", on_click=wl_add_input, use_container_width=True)
+    ic2.button("➕ Add", on_click=wl_add_input, **stretch_kw(st.button))
     if st.session_state.wl_msg:
         st.caption(st.session_state.wl_msg)
     wl = st.session_state.wl
@@ -949,12 +1114,12 @@ if page == PAGE_WL:
         if st.button("🔄 Sabka signal scan karo"):
             bar = st.progress(0.0)
             for k, s in enumerate(wl):
-                st.session_state.wl_scan[s] = scan_one(s, rr, capital, risk_pct)
+                st.session_state.wl_scan[s] = scan_one(s, rr, capital, risk_pct, int(time.time() // 300))
                 bar.progress((k + 1) / len(wl))
             bar.empty()
         for s in wl:
             r = st.session_state.wl_scan.get(s)
-            cur_s = "₹" if s.endswith((".NS", ".BO")) or s.startswith(("^NSE", "^BSE")) else ""
+            cur_s = "₹" if is_indian(s) else ""
             with st.container(border=True):
                 st.markdown(f"**{st.session_state.names.get(s) or s}** · `{s}`")
                 if r:
@@ -965,14 +1130,120 @@ if page == PAGE_WL:
                     st.caption("Scan nahi hua. Upar 'Sabka signal scan karo' dabao.")
                 b1, b2 = st.columns(2)
                 b1.button("📊 Chart kholo", key=f"open_{s}", on_click=open_symbol, args=(s,),
-                          use_container_width=True)
-                b2.button("❌ Hatao", key=f"rm_{s}", on_click=wl_remove, args=(s,), use_container_width=True)
+                          **stretch_kw(st.button))
+                b2.button("❌ Hatao", key=f"rm_{s}", on_click=wl_remove, args=(s,), **stretch_kw(st.button))
         st.caption("💡 Watchlist is page ke link (URL) me save hoti hai. Is page ko bookmark / 'Add to Home screen' "
                    "kar lo, to har baar wahi watchlist khulegi.")
     st.caption("⚠️ Sirf educational tool hai, financial advice nahi.")
     st.stop()
 
 # ------------------------------------------------------------------ CHART PAGE
+def chart_page(symbol, tf, overlays, pos_mode, view, capital, risk_pct, rr, secs, live, was_open):
+    """Everything below the controls. Runs as a fragment, so Live mode refreshes only this part."""
+    is_open = market_open(symbol)
+    if live and is_open != was_open:
+        st.rerun()  # market just opened / closed: re-arm the refresh timer
+    now_s = time.time()
+    if is_open:
+        b_fast = int(now_s // max(int(secs), 5)) if live else int(now_s // 300)
+        b_slow = int(now_s // max(int(secs), 60)) if live else int(now_s // 300)
+    else:
+        b_fast = b_slow = int(now_s // 1800)
+
+    first = st.session_state.get("_seen") != (symbol, tf)
+    with (st.spinner("Data load ho raha hai...") if first else nullcontext()):
+        d_df, stale_d = load_live(symbol, "1d", "5y", b_slow)
+        if tf == "1D":
+            chart_df, stale_c = d_df, stale_d
+        else:
+            chart_df, stale_c = load_live(symbol, *TF[tf], b_fast)
+        i_df, stale_i = load_live(symbol, "5m", "5d", b_fast)
+    st.session_state["_seen"] = (symbol, tf)
+
+    if d_df.empty:
+        st.error("Is symbol ka data nahi mila. Symbol check karo (NSE ke liye .NS, BSE ke liye .BO). "
+                 "Naya listing hai to thoda ruk kar 'Abhi refresh karo' try karo.")
+        return
+
+    name = st.session_state.names.get(symbol) or get_name(symbol)
+    cur = "₹" if is_indian(symbol) else ""
+    last = d_df.iloc[-1]
+    prev = d_df.iloc[-2] if len(d_df) > 1 else last
+    price = float(last["Close"])
+    chg = price - float(prev["Close"])
+    pct = chg / float(prev["Close"]) * 100 if float(prev["Close"]) else 0.0
+    wk = d_df.tail(252)
+
+    # ---- header + live status
+    hc1, hc2 = st.columns([3, 1])
+    hc1.subheader(name)
+    hc1.caption(f"{symbol} · {len(d_df)} trading din ka data")
+    if symbol in st.session_state.wl:
+        hc2.button("❌ Watchlist se hatao", key=f"wl_btn_{symbol}", on_click=wl_remove, args=(symbol,),
+                   **stretch_kw(st.button))
+    else:
+        hc2.button("⭐ Watchlist me add", key=f"wl_btn_{symbol}", on_click=wl_add, args=(symbol,),
+                   **stretch_kw(st.button))
+
+    stamp = ist_now()
+    ts = last_bar_ist(i_df if not i_df.empty else d_df)
+    age = (stamp - ts).total_seconds() / 60 if ts is not None else None
+    fresh = f"aakhri candle {ts:%d %b %H:%M} IST" if ts is not None else ""
+    if live and is_open:
+        st.caption(f"🟢 **LIVE** · {stamp:%H:%M:%S} IST · har {int(secs)} sec me auto-refresh · {fresh}")
+    elif is_open:
+        st.caption(f"⏸ Live band hai (upar toggle on karo) · {stamp:%H:%M:%S} IST · {fresh}")
+    else:
+        st.caption(f"⚪ Market abhi band hai · aakhri available data dikh raha hai · {fresh}")
+    if is_open and age is not None and age > 20 and is_indian(symbol):
+        st.warning(f"Yahoo ka data ~{age:.0f} min late hai. Free data me kabhi kabhi delay hota hai; "
+                   "asli tick-by-tick live ke liye broker API chahiye.")
+    if stale_d or stale_c or stale_i:
+        st.warning("Naya data nahi aa paya (Yahoo ne rok diya ho sakta hai), isliye pichhla data dikh raha hai.")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Price", f"{cur}{price:,.2f}", f"{chg:+.2f} ({pct:+.2f}%)")
+    m2.metric("Day Low – High", f"{cur}{float(last['Low']):,.2f} – {float(last['High']):,.2f}")
+    m3.metric("52W Low – High", f"{cur}{float(wk['Low'].min()):,.2f} – {float(wk['High'].max()):,.2f}")
+    m4.metric("Volume", f"{int(last['Volume']):,}")
+    if len(d_df) < 60:
+        st.info("🆕 Is stock ki history bahut kam hai (naya listing). Long-term signal kam reliable hoga.")
+
+    # ---- analysis
+    daily_atr = float(true_range(d_df).ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+    long_sig = analyze(d_df, False, CFG_LONG, daily_atr, rr, capital, risk_pct)
+    intra_sig = analyze(i_df, True, CFG_INTRA, daily_atr, rr, capital, risk_pct)
+
+    # ---- chart
+    chart_pats = []
+    chart_df = prep_chart_df(chart_df, tf)
+    if chart_df is None or chart_df.empty or len(chart_df) < 2:
+        st.warning(f"{tf} timeframe ka data is stock ke liye available nahi hai. Koi aur timeframe chuno.")
+    else:
+        chart_pats = find_patterns(chart_df)
+        chart_sig = intra_sig if tf in INTRADAY_TF else long_sig
+        rev = f"{symbol}|{tf}|{view}|{len(chart_df) // 30}"
+        fig = build_figure(chart_df, tf, name, symbol, overlays, chart_sig, pos_mode, chart_pats, view, rev)
+        st.plotly_chart(fig, theme=None, config=PLOT_CONFIG, key=f"chart_{symbol}_{tf}",
+                        **stretch_kw(st.plotly_chart))
+        st.caption("👆 Ungli se drag = scroll · 2 ungli se pinch = zoom · double tap = reset. "
+                   "Position tool (Long/Short box) 1m–1h chart par Intraday signal se, 1D+ par Long Term signal se "
+                   "banta hai: 🟩 profit zone, 🟥 risk zone.")
+        render_patterns(chart_pats, cur, tf)
+
+    tab1, tab2 = st.tabs(["⚡ Intraday", "📅 Long Term"])
+    with tab1:
+        st.caption("5-minute candles (last 5 din) par based. Din ke andar ka trade.")
+        render_tab(intra_sig, "intraday", daily_atr, cur,
+                   "Intraday data available nahi ya bahut kam hai (market band ya naya listing ho sakta hai).")
+    with tab2:
+        st.caption("Daily candles (last 5 saal tak) par based. Hafton/mahino ki position.")
+        render_tab(long_sig, "long", daily_atr, cur,
+                   "Long-term signal ke liye kam se kam 30 trading din ka data chahiye. Stock bahut naya hai.")
+
+    st.caption("⚠️ Sirf educational tool hai, financial advice nahi. Pehle paper trading me test karo.")
+
+
 symbol = st.session_state.symbol
 try:
     st.query_params["s"] = symbol
@@ -980,7 +1251,7 @@ except Exception:
     pass
 
 tf = st.radio("Timeframe", list(TF.keys()), index=5, horizontal=True, label_visibility="collapsed")
-oc1, oc2 = st.columns([3, 1])
+oc1, oc2, oc3 = st.columns([3, 1, 1])
 overlays = oc1.multiselect(
     "Chart par dikhao",
     ["EMA 20/50", "VWAP", "Volume", "Support/Resistance", "Position tool", "Chart patterns", "Candle patterns"],
@@ -988,67 +1259,24 @@ overlays = oc1.multiselect(
 )
 pos_mode = oc2.selectbox("Position tool", ["Auto", "Long", "Short", "Off"],
                          help="Auto = strategy ke signal ke hisaab se Long ya Short. Long/Short = jo chaho wo dikhao.")
+view = oc3.selectbox("Chart view", ["50", "110", "250", "Sab"], index=1,
+                     help="Chart shuru me kitni candles dikhaye. Baad me ungli se zoom/scroll kar sakte ho.")
 
-with st.spinner("Data load ho raha hai..."):
-    chart_df = load(symbol, *TF[tf])
-    d_df = load(symbol, "1d", "5y")
-    i_df = load(symbol, "5m", "5d")
+lv1, lv2, lv3 = st.columns([1, 1, 2])
+live = lv1.toggle("🔴 Live", value=True,
+                  help="Market chalu ho tab chart aur price apne aap refresh hote rehte hain.")
+secs = lv2.selectbox("Refresh", [10, 15, 30, 60], index=2, format_func=lambda s: f"{s} sec",
+                     label_visibility="collapsed", disabled=not live)
+lv3.caption("Free Yahoo data: kuch minute late ho sakta hai.")
 
-if d_df.empty:
-    st.error("Is symbol ka data nahi mila. Symbol check karo (NSE ke liye .NS, BSE ke liye .BO). "
-             "Naya listing hai to thoda ruk kar 'Data refresh' try karo.")
-    st.stop()
-if chart_df.empty:
-    st.warning(f"{tf} timeframe ka data is stock ke liye available nahi hai. Koi aur timeframe chuno.")
-
-name = st.session_state.names.get(symbol) or get_name(symbol)
-cur = "₹" if symbol.endswith((".NS", ".BO")) or symbol.startswith(("^NSE", "^BSE")) else ""
-
-last = d_df.iloc[-1]
-prev = d_df.iloc[-2] if len(d_df) > 1 else last
-price = float(last["Close"])
-chg = price - float(prev["Close"])
-pct = chg / float(prev["Close"]) * 100 if float(prev["Close"]) else 0.0
-wk = d_df.tail(252)
-hc1, hc2 = st.columns([3, 1])
-hc1.subheader(name)
-hc1.caption(f"{symbol} · {len(d_df)} trading din ka data")
-if symbol in st.session_state.wl:
-    hc2.button("❌ Watchlist se hatao", on_click=wl_remove, args=(symbol,), use_container_width=True)
+open_now = market_open(symbol)
+chart_args = (symbol, tf, overlays, pos_mode, view, capital, risk_pct, rr, secs, live, open_now)
+if live and hasattr(st, "fragment"):
+    every = int(secs) if open_now else 300
+    try:
+        runner = st.fragment(run_every=every, key="live_chart")
+    except TypeError:  # older Streamlit without the `key` argument
+        runner = st.fragment(run_every=every)
+    runner(chart_page)(*chart_args)
 else:
-    hc2.button("⭐ Watchlist me add", on_click=wl_add, args=(symbol,), use_container_width=True)
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Price", f"{cur}{price:,.2f}", f"{chg:+.2f} ({pct:+.2f}%)")
-m2.metric("Day Low – High", f"{cur}{float(last['Low']):,.2f} – {float(last['High']):,.2f}")
-m3.metric("52W Low – High", f"{cur}{float(wk['Low'].min()):,.2f} – {float(wk['High'].max()):,.2f}")
-m4.metric("Volume", f"{int(last['Volume']):,}")
-if len(d_df) < 60:
-    st.info("🆕 Is stock ki history bahut kam hai (naya listing). Long-term signal kam reliable hoga.")
-
-daily_atr = float(true_range(d_df).ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
-long_sig = analyze(d_df, False, CFG_LONG, daily_atr, rr, capital, risk_pct)
-intra_sig = analyze(i_df, True, CFG_INTRA, daily_atr, rr, capital, risk_pct)
-
-chart_pats = []
-if not chart_df.empty:
-    chart_pats = find_patterns(chart_df)
-    chart_sig = intra_sig if tf in INTRADAY_TF else long_sig
-    render_chart(chart_df, tf, f"{name} ({symbol})", overlays, chart_sig, pos_mode, chart_pats)
-    st.caption("👆 Ungli se drag = scroll · 2 ungli se pinch = zoom · neeche ke buttons se bhi zoom. "
-               "Position tool (Long/Short box) 1m–1h chart par Intraday signal se, 1D+ par Long Term signal se banta hai: "
-               "🟩 profit zone, 🟥 risk zone.")
-
-if not chart_df.empty:
-    render_patterns(chart_pats, cur, tf)
-
-tab1, tab2 = st.tabs(["⚡ Intraday", "📅 Long Term"])
-with tab1:
-    st.caption("5-minute candles (last 5 din) par based. Din ke andar ka trade.")
-    render_tab(intra_sig, "intraday", daily_atr, cur,
-               "Intraday data available nahi ya bahut kam hai (market band ya naya listing ho sakta hai).")
-with tab2:
-    st.caption("Daily candles (last 5 saal tak) par based. Hafton/mahino ki position.")
-    render_tab(long_sig, "long", daily_atr, cur,
-               "Long-term signal ke liye kam se kam 30 trading din ka data chahiye. Stock bahut naya hai.")
-
-st.caption("⚠️ Sirf educational tool hai, financial advice nahi. Pehle paper trading me test karo.")
+    chart_page(*chart_args)
