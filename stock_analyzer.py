@@ -1,9 +1,23 @@
-""" Stock Analyzer v4 - Native Plotly chart (finger scroll / pinch zoom / timeframes) + LIVE auto-refresh - Auto chart patterns drawn on chart (+ explanation and expected move) - Long / Short position tool (Entry, Stop-loss, Targets) drawn on chart - Watchlist (saved in the page URL), search incl. new listings Run locally: streamlit run stock_analyzer.py Educational tool only. Not financial advice. """
+"""
+Stock Analyzer v5
+- Smooth live price (background fetch, small ticker fragment, no page blink)
+- Locked Long/Short trades (levels never move until target / SL), journal with auto "why wrong" notes
+- Saved watchlist / settings / trades (GitHub Gist), optional exact Groww price
+- Auto chart patterns drawn on chart (+ explanation and expected move)
+- Long / Short position tool (Entry, Stop-loss, Targets) drawn on chart
+- Watchlist (saved in the page URL), search incl. new listings
+Run locally:  streamlit run stock_analyzer.py
+Educational tool only. Not financial advice.
+"""
+import copy
 import html
 import inspect
+import json
 import math
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
@@ -14,6 +28,10 @@ import requests
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
+
+import feed
+import storage
+import trades as tr
 
 st.set_page_config(page_title="Stock Analyzer", page_icon="📈", layout="wide")
 st.markdown(
@@ -103,18 +121,96 @@ def load(sym, interval, period, bucket=0):
     return df[~df.index.duplicated(keep="last")]
 
 
-def load_live(sym, interval, period, bucket):
-    """Like load(), but falls back to the last good data if Yahoo fails. Returns (df, is_stale)."""
-    df = load(sym, interval, period, bucket)
-    store = st.session_state.setdefault("last_good", {})
-    key = f"{sym}|{interval}|{period}"
+# ------------------------------------------------------------------ background data hub (no blocking, no blink)
+class Hub:
+    """Fetches prices / candles in background threads. The UI always gets the last good value instantly,
+    so a refresh never makes the page wait (that wait was the 'blink')."""
+
+    def __init__(self):
+        self.pool = ThreadPoolExecutor(max_workers=6)
+        self.lock = threading.Lock()
+        self.data = {}
+        self.busy = set()
+
+    def _run(self, key, fn):
+        try:
+            v = fn()
+            ok = v is not None and not (isinstance(v, pd.DataFrame) and v.empty)
+        except Exception:
+            v, ok = None, False
+        with self.lock:
+            cur = self.data.get(key) or {}
+            if ok:
+                self.data[key] = dict(v=v, t=time.time(), fail=0, next=0.0)
+            else:
+                fail = cur.get("fail", 0) + 1
+                self.data[key] = dict(v=cur.get("v"), t=cur.get("t", 0.0), fail=fail,
+                                      next=time.time() + min(120, 5 * 2 ** fail))
+            self.busy.discard(key)
+            if len(self.data) > 90:
+                for k in sorted(self.data, key=lambda k_: self.data[k_]["t"])[:15]:
+                    self.data.pop(k, None)
+
+    def get(self, key, fn, ttl, wait=False):
+        """-> (value or None, age_seconds or None, is_stale). Blocks only if wait=True AND nothing is cached yet."""
+        now = time.time()
+        with self.lock:
+            e = self.data.get(key)
+            if key not in self.busy and (e is None or (now - e["t"] > ttl and now >= e.get("next", 0.0))):
+                self.busy.add(key)
+                self.pool.submit(self._run, key, fn)
+        if wait and (e is None or e.get("v") is None):
+            t0 = time.time()
+            while time.time() - t0 < 25:
+                with self.lock:
+                    e = self.data.get(key)
+                    if e is not None and key not in self.busy:
+                        break
+                time.sleep(0.05)
+        with self.lock:
+            e = self.data.get(key)
+        if e is None or e.get("v") is None:
+            return None, None, False
+        return e["v"], time.time() - e["t"], e.get("fail", 0) > 0
+
+
+@st.cache_resource
+def get_hub():
+    return Hub()
+
+
+def secret(name):
+    try:
+        v = st.secrets.get(name)
+        return str(v).strip() if v else None
+    except Exception:
+        return None
+
+
+def groww_cfg():
+    return dict(api_key=secret("GROWW_API_KEY"), secret=secret("GROWW_API_SECRET"))
+
+
+def fetch_candles(sym, interval, period):
+    df = yf.Ticker(sym).history(interval=interval, period=period, auto_adjust=True, actions=False)
     if df is None or df.empty:
-        old = store.get(key)
-        return (old, True) if old is not None else (pd.DataFrame(), False)
-    store[key] = df
-    while len(store) > 14:
-        store.pop(next(iter(store)))
-    return df, False
+        return None
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    if interval in ("1d", "1wk", "1mo") and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    return df[~df.index.duplicated(keep="last")]
+
+
+def hist(sym, interval, period, ttl, wait=True):
+    """-> (DataFrame, is_stale). Never blocks once data has been loaded one time."""
+    v, _, stale = get_hub().get(("h", sym, interval, period), lambda: fetch_candles(sym, interval, period), ttl, wait)
+    return (v if v is not None else pd.DataFrame()), stale
+
+
+def live_quote(sym, ttl=3.0, wait=False):
+    cfg = groww_cfg()
+    v, _, _ = get_hub().get(("q", sym, bool(cfg["api_key"])), lambda: feed.get_quote(sym, cfg, ttl=0.5), ttl, wait)
+    return v
 
 
 def last_bar_ist(df):
@@ -522,6 +618,8 @@ def build_signal(df, pats, cpats, intraday, daily_atr, rr, capital, risk_pct):
     price, atr = float(last["Close"]), float(last["ATR"])
     state = {"score": 0}
     reasons = []
+    trend = "mixed"
+    vol_ratio = None
 
     def add(cat, text, s):
         state["score"] += s
@@ -529,8 +627,10 @@ def build_signal(df, pats, cpats, intraday, daily_atr, rr, capital, risk_pct):
 
     # Trend
     if last["EMA_F"] > last["EMA_S"] and price > last["EMA_S"]:
+        trend = "up"
         add("Trend", "Trend upar hai (fast EMA > slow EMA, price dono ke upar)", 2)
     elif last["EMA_F"] < last["EMA_S"] and price < last["EMA_S"]:
+        trend = "down"
         add("Trend", "Trend niche hai (fast EMA < slow EMA, price dono ke niche)", -2)
     else:
         add("Trend", "Trend mixed / sideways hai", 0)
@@ -583,6 +683,7 @@ def build_signal(df, pats, cpats, intraday, daily_atr, rr, capital, risk_pct):
     vol = df["Volume"]
     if len(vol) > 21 and float(vol.iloc[-21:-1].mean()) > 0:
         vr = float(vol.iloc[-1]) / float(vol.iloc[-21:-1].mean())
+        vol_ratio = vr
         green = last["Close"] > last["Open"]
         if vr >= 1.5:
             add("Volume", f"Volume {vr:.1f}x average, {'green' if green else 'red'} candle ke saath",
@@ -631,7 +732,7 @@ def build_signal(df, pats, cpats, intraday, daily_atr, rr, capital, risk_pct):
     return dict(side=side, score=score, strength=strength, reasons=reasons,
                 plan=plans[side] if side != "WAIT" else None, plans=plans, cond=cond,
                 support=support, resistance=resistance, price=price, rsi=rsi, adx=adx,
-                pats=pats, cpats=cpats)
+                pats=pats, cpats=cpats, vol_ratio=vol_ratio, trend=trend, atr=daily_atr)
 
 
 def analyze(df, intraday, cfg, daily_atr, rr, capital, risk_pct):
@@ -702,7 +803,15 @@ def pick_plan(sig, pos_mode):
     return sig["plans"][side], "Signal WAIT: sirf reference plan"
 
 
-def build_figure(df, tf, name, symbol, overlays, sig, pos_mode, pat_list, view, rev):
+def bar_pos(index, ts):
+    """Position of the candle that contains time `ts` (None if before the first candle)."""
+    idx = pd.DatetimeIndex(index)
+    idx = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
+    p = int(idx.searchsorted(tr.to_ts(ts), side="right")) - 1
+    return p if p >= 0 else None
+
+
+def build_figure(df, tf, name, symbol, overlays, sig, pos_mode, pat_list, view, rev, trades_draw=None):
     n = len(df)
     daily = tf not in INTRADAY_TF
     labs = make_labels(df.index, tf)
@@ -805,51 +914,75 @@ def build_figure(df, tf, name, symbol, overlays, sig, pos_mode, pat_list, view, 
             textfont=dict(color=color, size=10), marker=dict(symbol=sym, size=9, color=color)),
             row=1, col=1)
 
-    # ---- long / short position tool
-    plan, note = (None, None)
-    if sig and "Position tool" in overlays:
-        plan, note = pick_plan(sig, pos_mode)
+    # ---- long / short position tool (locked trades first, else a reference plan)
+    tool_on = "Position tool" in overlays and pos_mode != "Off"
     box_bars = max(12, min(40, n // 6))
     vis = n if view == "Sab" else min(int(view), n)
     lo_v, hi_v = float(np.nanmin(l[-vis:])), float(np.nanmax(h[-vis:]))
+    draw = []
+    if tool_on:
+        for t in (trades_draw or []):
+            p0 = bar_pos(df.index, t["entry_ts"])
+            if p0 is None:
+                continue
+            closed_t = t["status"] == "CLOSED"
+            if closed_t:
+                p1 = bar_pos(df.index, t["closed"])
+                x1 = max(n - 1 if p1 is None else p1, p0) + 1
+            else:
+                x1 = n - 1 + 8
+            draw.append(dict(x0=p0, x1=x1, e=t["entry"], sl=t["sl0"], t1=t["t1"], t2=t["t2"], rr=t.get("rr") or 2,
+                             sgn=tr.sgn(t), locked=True, closed=closed_t, t=t, note=None))
+        if not draw and sig:
+            plan, note = pick_plan(sig, pos_mode)
+            if plan:
+                draw.append(dict(x0=n - 1, x1=n - 1 + box_bars, e=plan["entry"], sl=plan["sl"], t1=plan["t1"],
+                                 t2=plan["t2"], rr=plan["rr"], sgn=1 if plan["side"] == "BUY" else -1,
+                                 locked=False, closed=False, t=None, note=note))
     ext = 6
-    if plan:
-        ext = box_bars + 3
-        lo_v, hi_v = min(lo_v, plan["sl"], plan["t2"]), max(hi_v, plan["sl"], plan["t2"])
-        x0, x1 = n - 1, n - 1 + box_bars
-        sgn = 1 if plan["side"] == "BUY" else -1
-        e, sl_, t1, t2 = (f2(plan[k]) for k in ("entry", "sl", "t1", "t2"))
+    for d in draw:
+        ext = max(ext, d["x1"] - (n - 1) + 3)
+        lo_v, hi_v = min(lo_v, d["sl"], d["t2"]), max(hi_v, d["sl"], d["t2"])
+        x0, x1, sgn = d["x0"], d["x1"], d["sgn"]
+        e, sl_, t1, t2 = f2(d["e"]), f2(d["sl"]), f2(d["t1"]), f2(d["t2"])
+        fa = 0.10 if d["closed"] else 0.22
 
-        def pc(x):
+        def pc(x, e=e):
             return (x / e - 1) * 100 if e else 0.0
 
-        fig.add_shape(type="rect", x0=x0, x1=x1, y0=e, y1=t2, fillcolor="rgba(38,166,154,0.22)",
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=e, y1=t2, fillcolor=f"rgba(38,166,154,{fa})",
                       line_width=0, layer="below", row=1, col=1)
-        fig.add_shape(type="rect", x0=x0, x1=x1, y0=e, y1=sl_, fillcolor="rgba(239,83,80,0.24)",
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=e, y1=sl_, fillcolor=f"rgba(239,83,80,{fa + 0.02})",
                       line_width=0, layer="below", row=1, col=1)
         for yv, colr, dash, wd in [(e, BLUE, "solid", 1.6), (sl_, RED, "solid", 1.6),
                                    (t1, GREEN, "dash", 1.2), (t2, GREEN, "solid", 1.6)]:
             fig.add_shape(type="line", x0=x0, x1=x1, y0=yv, y1=yv,
                           line=dict(color=colr, width=wd, dash=dash), row=1, col=1)
 
-        def tag(yv, text, colr, above, left=True):
+        def tag(yv, text, colr, above, left=True, x0=x0, x1=x1):
             fig.add_annotation(x=(x0 + 0.4) if left else (x1 - 0.4), y=yv, text=text, showarrow=False,
                                xanchor="left" if left else "right", yanchor="bottom" if above else "top",
                                font=dict(color=colr, size=11), bgcolor="rgba(14,17,23,0.7)", row=1, col=1)
 
+        side_w = "LONG" if sgn > 0 else "SHORT"
         tag(t2, f"T2 {t2:,.2f} ({pc(t2):+.2f}%)", GREEN, sgn > 0)
         tag(t1, f"T1 {t1:,.2f} ({pc(t1):+.2f}%)", GREEN, sgn > 0)
-        tag(e, f"{'LONG' if sgn > 0 else 'SHORT'} Entry {e:,.2f} R:R 1:{plan['rr']:g}", BLUE, True)
+        tag(e, f"{'🔒 ' if d['locked'] else ''}{side_w} Entry {e:,.2f}  R:R 1:{d['rr']:g}", BLUE, True)
         tag(sl_, f"SL {sl_:,.2f} ({pc(sl_):+.2f}%)", RED, sgn < 0)
-        if note:
-            tag(min(sl_, t2), note, AMBER, False, left=False)
+        if d["note"]:
+            tag(min(sl_, t2), d["note"], AMBER, False, left=False)
+        if d["closed"]:
+            t = d["t"]
+            ok = (t["pnl"] or 0) > 0
+            tag(t["exit_price"], f"{'✔' if ok else '✖'} {tr.RES_TEXT.get(t['result'], t['result'])} "
+                f"{t['r_mult']:+.2f}R", GREEN if ok else RED, ok == (sgn > 0), left=False)
 
     pad = (hi_v - lo_v) * 0.06 or max(abs(last) * 0.01, 0.01)
     fig.update_yaxes(range=[lo_v - pad, hi_v + pad], row=1, col=1)
     fig.update_xaxes(range=[n - vis - 0.5, n - 1 + ext + 0.5])
 
     title = (f"<b>{html.escape(name)}</b> · {html.escape(symbol)} · {tf}"
-             f" O {o[-1]:,.2f} H {h[-1]:,.2f} L {l[-1]:,.2f} C {c[-1]:,.2f}")
+             f"   O {o[-1]:,.2f}  H {h[-1]:,.2f}  L {l[-1]:,.2f}  C {c[-1]:,.2f}")
     fig.update_xaxes(type="category", categoryorder="array", categoryarray=labs, rangeslider_visible=False,
                      showgrid=False, showspikes=True, spikemode="across", spikesnap="cursor",
                      spikethickness=1, spikecolor="#8b93a7", spikedash="dot", nticks=8, tickangle=0)
@@ -891,7 +1024,7 @@ def plan_rows(p, cur):
     return pd.DataFrame(rows, columns=["Level", "Value", "Move"]).set_index("Level")
 
 
-def render_tab(sig, kind, daily_atr, cur, empty_msg):
+def render_tab(sig, kind, daily_atr, cur, empty_msg, symbol=None, name=None):
     if sig is None:
         st.info(empty_msg)
         return
@@ -902,17 +1035,25 @@ def render_tab(sig, kind, daily_atr, cur, empty_msg):
     else:
         label = {"BUY": "BUY / ACCUMULATE", "SELL": "AVOID / EXIT", "WAIT": "WAIT"}[side]
     box = {"BUY": st.success, "SELL": st.error, "WAIT": st.warning}[side]
-    box(f"### {label}\nScore **{sig['score']:+d}** · Strength **{sig['strength']}** · "
-        f"BUY ≥ +4, SELL ≤ −4 · RSI **{sig['rsi']:.0f}**")
+    box(f"### {label}\nScore **{sig['score']:+d}**  ·  Strength **{sig['strength']}**  ·  "
+        f"BUY ≥ +4, SELL ≤ −4  ·  RSI **{sig['rsi']:.0f}**")
 
     st.markdown("#### 📍 Trade plan")
-    if sig["plan"]:
+    ot = open_trade(symbol, kind) if symbol else None
+    if ot:
+        render_open_trade(ot, cur)
+    elif sig["plan"]:
+        st.caption("Reference plan: last COMPLETED candle se bana hai, live price ke saath badalta nahi.")
         st.table(plan_rows(sig["plan"], cur))
         if intraday:
             st.caption("Intraday: din ke end tak position band karo. SELL = short selling. "
                        "Target/SL aaj ki volatility (daily ATR) se bane hain.")
         elif side == "SELL":
             st.caption("Long term me SELL = fresh buy avoid karo, holding ho to exit ya stop-loss lagao.")
+        if symbol:
+            st.button("🔒 Is signal par trade LOCK karo (live price par)", key=f"lock_{symbol}_{kind}",
+                      on_click=lock_trade, args=(symbol, name, kind, side, "signal"),
+                      help="Entry/SL/Target tab tak chart par ek hi jagah rahenge jab tak target ya SL hit na ho.")
     else:
         st.write("Abhi clear signal nahi hai, isliye **breakout ka wait** karo. Conditional plans:")
         cl, cs = sig["cond"]["BUY"], sig["cond"]["SELL"]
@@ -925,6 +1066,13 @@ def render_tab(sig, kind, daily_atr, cur, empty_msg):
         ]
         st.table(pd.DataFrame(rows, columns=["", "🟢 Long (upar breakout)", "🔴 Short (niche breakdown)"]).set_index(""))
         st.caption("Candle trigger ke upar/niche close ho tabhi entry lo, sirf touch par nahi.")
+        if symbol:
+            with st.expander("✋ Khud decision lo (manual entry lock)"):
+                m1, m2 = st.columns(2)
+                m1.button("🟢 Long lock", key=f"mlong_{symbol}_{kind}", on_click=lock_trade,
+                          args=(symbol, name, kind, "BUY", "manual"), **stretch_kw(st.button))
+                m2.button("🔴 Short lock", key=f"mshort_{symbol}_{kind}", on_click=lock_trade,
+                          args=(symbol, name, kind, "SELL", "manual"), **stretch_kw(st.button))
 
     st.markdown("#### 📏 Kitna upar / niche ja sakta hai (approx)")
     price = sig["price"]
@@ -978,6 +1126,211 @@ def render_patterns(pat_list, cur, tf):
                     parts.append(f"**{cur}{p['down_level']:,.2f}** ke niche close → pattern fail")
                 st.write("⏳ Abhi pattern ban raha hai (confirm nahi): " + "; ".join(parts) + ".")
     st.caption("Pattern auto-detection ek andaza hai, confirmation (close + volume) ka wait zaroor karo.")
+
+
+# ================================================================== trades (locked levels) + signals
+def open_trade(symbol, kind):
+    for t in st.session_state.trades:
+        if t["symbol"] == symbol and t["kind"] == kind and t["status"] != "CLOSED":
+            return t
+    return None
+
+
+def lock_trade(symbol, name, kind, side, mode):
+    """Freeze entry / SL / targets. They never change after this until the trade closes."""
+    ss = st.session_state
+    sig = ss.get("_sig", {}).get((symbol, kind))
+    if not sig:
+        st.toast("Signal ready nahi hai, thoda ruko.")
+        return
+    if open_trade(symbol, kind):
+        return
+    if kind == "intraday" and is_indian(symbol) and not market_open(symbol):
+        st.toast("Market band hai - intraday trade abhi lock nahi hoga.")
+        return
+    plan = sig["plan"] if (mode in ("signal", "auto") and sig["plan"]) else sig["plans"]["BUY" if side == "BUY" else "SELL"]
+    q = live_quote(symbol, ttl=2.0, wait=True)
+    entry = q["price"] if q else sig["price"]
+    t = tr.new_trade(plan, entry, symbol, name or symbol, kind, "5m" if kind == "intraday" else "1D", mode,
+                     tr.now_ist(), sig=sig, tick=0.05 if is_indian(symbol) else 0.01)
+    if t["qty"] < 1:
+        st.toast("Capital/risk ke hisaab se quantity 0 aa rahi hai. Settings me capital badhao.")
+        return
+    ss.trades.append(t)
+    st.toast(f"🔒 {symbol} {t['side']} lock @ {entry:,.2f}")
+
+
+def manual_exit_cb(tid):
+    for t in st.session_state.trades:
+        if t["id"] == tid and t["status"] != "CLOSED":
+            q = live_quote(t["symbol"], ttl=2.0, wait=True)
+            px = q["price"] if q else t["entry"]
+            tr.manual_exit(t, px, tr.now_ist())
+            tr.postmortem(t)
+            st.toast(f"{t['symbol']} exit @ {px:,.2f}")
+
+
+def delete_trade_cb(tid):
+    st.session_state.trades = [t for t in st.session_state.trades if t["id"] != tid]
+
+
+def note_cb(tid):
+    for t in st.session_state.trades:
+        if t["id"] == tid:
+            t["note"] = st.session_state.get(f"note_{tid}", "")
+
+
+def render_open_trade(t, cur):
+    q = live_quote(t["symbol"], ttl=3.0)
+    px = q["price"] if q else None
+    s = tr.sgn(t)
+    side_w = "LONG (BUY)" if s > 0 else "SHORT (SELL)"
+    st.info(f"🔒 **{side_w} trade LOCKED** · {t['opened'][:16].replace('T', ' ')} · mode: {t['mode']}\n\n"
+            "Ye levels ab price ke saath nahi badlenge. Sirf target / stop-loss hit hone par trade band hoga.")
+    p = dict(entry=t["entry"], sl=t["sl0"], t1=t["t1"], t2=t["t2"], rr=t.get("rr") or 2,
+             risk=abs(t["entry"] - t["sl0"]), qty=t["qty"])
+    st.table(plan_rows(p, cur))
+    if t["t1_done"]:
+        st.success(f"✅ Target 1 hit. Stop-loss ab entry ({cur}{t['entry']:,.2f}) par (break-even); aadhi qty book.")
+    if px:
+        pnl = t["realized"] + t["qty_left"] * (px - t["entry"]) * s
+        st.metric("Live P&L", f"{cur}{pnl:,.0f}", f"{(px / t['entry'] - 1) * 100 * s:+.2f}%")
+    st.button("🚪 Abhi exit karo (manual)", key=f"exit_{t['id']}", on_click=manual_exit_cb, args=(t["id"],))
+
+
+def process_trades(only=None, q=None, wait=False):
+    """Replay candles for every open trade from its ORIGINAL levels, then apply the live tick."""
+    ss = st.session_state
+    now = tr.now_ist()
+    for t in ss.trades:
+        sym = t["symbol"]
+        if only and sym != only:
+            continue
+        if t["status"] == "CLOSED":
+            if t.get("after") is None and (t.get("pnl") or 0) < 0 and t.get("closed"):
+                fine, _ = hist(sym, "5m", "1mo", 900, wait=False)
+                tr.post_exit_check(t, fine)
+            continue
+        fine, _ = hist(sym, "5m", "1mo", 60 if market_open(sym) else 900, wait=wait)
+        coarse = None
+        if t["kind"] == "long":
+            coarse, _ = hist(sym, "1d", "2y", 900, wait=wait)
+        if fine.empty and (coarse is None or coarse.empty):
+            continue
+        tr.evaluate_trade(t, fine, coarse)
+        qq = q if (q and sym == only) else live_quote(sym, ttl=5.0, wait=False)
+        px = qq["price"] if qq else None
+        if t["status"] != "CLOSED" and px:
+            tr.apply_price(t, px, now)
+        if t["status"] != "CLOSED":
+            last_px = px or (float(fine["Close"].iloc[-1]) if not fine.empty else t["entry"])
+            tr.check_expiry(t, last_px, now)
+        if t["status"] == "CLOSED":
+            tr.postmortem(t)
+            ok = (t["pnl"] or 0) > 0
+            st.toast(f"{'🎯' if ok else '🛑'} {sym} {tr.RES_TEXT.get(t['result'], t['result'])} · {t['r_mult']:+.2f}R")
+
+
+def get_signals(symbol, d_df, i_df, rr, capital, risk_pct):
+    """Signals from COMPLETED candles only, memoised per candle: they stay constant inside a candle."""
+    ss = st.session_state
+    d_c = tr.drop_forming(d_df, 0)
+    i_c = tr.drop_forming(i_df, 5)
+    if d_c is None or len(d_c) < 15:
+        return None, None, 0.0
+    daily_atr = float(true_range(d_c).ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+    memo = ss.setdefault("_memo", {})
+    sigs = ss.setdefault("_sig", {})
+
+    def one(kind, df, cfg, intraday):
+        if df is None or df.empty:
+            return None
+        key = (symbol, kind, str(df.index[-1]), len(df), rr, capital, risk_pct, round(daily_atr, 2))
+        if key not in memo:
+            memo[key] = analyze(df, intraday, cfg, daily_atr, rr, capital, risk_pct)
+            while len(memo) > 24:
+                memo.pop(next(iter(memo)))
+        sigs[(symbol, kind)] = memo[key]
+        return memo[key]
+
+    return (one("long", d_c, CFG_LONG, False), one("intraday", i_c.tail(400) if i_c is not None else None,
+                                                    CFG_INTRA, True), daily_atr)
+
+
+def maybe_auto(symbol, name, intra_sig, long_sig):
+    ss = st.session_state
+    if not ss.get("auto"):
+        return
+    if sum(1 for t in ss.trades if t["status"] != "CLOSED") >= 8:
+        return
+    for kind, sig in (("intraday", intra_sig), ("long", long_sig)):
+        if kind == "intraday" and not (is_indian(symbol) and market_open(symbol)):
+            continue
+        if sig and tr.can_auto(sig, symbol, kind, ss.trades):
+            lock_trade(symbol, name, kind, sig["side"], "auto")
+
+
+# ================================================================== save / load
+@st.cache_resource
+def get_store(token, gist_id):
+    return storage.Store(dict(token=token, gist_id=gist_id))
+
+
+SETTING_KEYS = ["cap", "risk", "rrr", "live", "secs", "auto"]
+SETTING_DEFAULT = dict(cap=100000, risk=1.0, rrr=2.0, live=True, secs=30, auto=True)
+
+
+def collect_db():
+    ss = st.session_state
+    sett = {k: ss.get(k, SETTING_DEFAULT[k]) for k in SETTING_KEYS}
+    sett["symbol"] = ss.get("symbol", "RELIANCE.NS")
+    sett["names"] = {k: v for k, v in ss.get("names", {}).items() if k in ss.wl}
+    return dict(version=1, watchlist=list(ss.wl), settings=sett, trades=ss.trades, notes=ss.get("notes", ""),
+                updated="")
+
+
+def apply_db(db, url_wl=None):
+    ss = st.session_state
+    db = storage.fill(db)
+    sett = db["settings"]
+    ss.trades = db["trades"]
+    ss.notes = db["notes"]
+    wl = db["watchlist"] or url_wl or []
+    ss.wl = [s for s in (clean_symbol(x) for x in wl) if s][:MAX_WL]
+    ss.setdefault("wl_scan", {})
+    ss.setdefault("names", {})
+    ss.names.update(sett.get("names") or {})
+    for k in SETTING_KEYS:
+        v = sett.get(k, SETTING_DEFAULT[k])
+        ss[k] = type(SETTING_DEFAULT[k])(v) if v is not None else SETTING_DEFAULT[k]
+    if ss.secs not in (10, 15, 30, 60):
+        ss.secs = 30
+    if sett.get("symbol"):
+        ss.symbol = clean_symbol(sett["symbol"]) or "RELIANCE.NS"
+
+
+def _save_bg(store, snap):
+    store._busy = True
+    try:
+        store.save(snap)
+    finally:
+        store._busy = False
+
+
+def persist(force=False):
+    ss = st.session_state
+    if not ss.get("db_ready"):
+        return
+    store = get_store(secret("GITHUB_TOKEN"), secret("GIST_ID"))
+    snap = copy.deepcopy(collect_db())
+    if storage._cmp_key(storage.fill(copy.deepcopy(snap))) == store.last_key:
+        return
+    if getattr(store, "_busy", False):
+        return
+    if not force and time.time() - ss.get("_last_save", 0) < 8:
+        return
+    ss["_last_save"] = time.time()
+    threading.Thread(target=_save_bg, args=(store, snap), daemon=True).start()
 
 
 # ================================================================== state / callbacks
@@ -1051,14 +1404,33 @@ def wl_add_input():
     st.session_state.wl_input = ""
 
 
-if "symbol" not in st.session_state:
-    qp_s = clean_symbol(st.query_params.get("s", "")) if hasattr(st, "query_params") else ""
-    st.session_state.symbol = qp_s or "RELIANCE.NS"
+def restore_cb():
+    f = st.session_state.get("restore_file")
+    try:
+        apply_db(json.loads(f.getvalue().decode("utf-8")))
+        _sync_url()
+        st.session_state.restore_msg = "✅ Backup restore ho gaya."
+        st.session_state._last_save = 0
+    except Exception as e:
+        st.session_state.restore_msg = f"❌ Restore fail: {str(e)[:100]}"
+
+
+# ------------------------------------------------------------------ boot: load saved data once per session
+store = get_store(secret("GITHUB_TOKEN"), secret("GIST_ID"))
+if "db_ready" not in st.session_state:
+    url_wl = []
+    qp_s = ""
+    try:
+        url_wl = str(st.query_params.get("wl", "")).split(",")
+        qp_s = clean_symbol(st.query_params.get("s", ""))
+    except Exception:
+        pass
     st.session_state.names = {}
-if "wl" not in st.session_state:
-    raw = st.query_params.get("wl", "") if hasattr(st, "query_params") else ""
-    st.session_state.wl = [s for s in (clean_symbol(x) for x in str(raw).split(",")) if s][:MAX_WL]
-    st.session_state.wl_scan = {}
+    st.session_state.symbol = "RELIANCE.NS"
+    apply_db(store.load(), url_wl)
+    if qp_s:
+        st.session_state.symbol = qp_s
+    st.session_state.db_ready = True
 st.session_state.setdefault("page", PAGE_CHART)
 st.session_state.setdefault("wl_msg", "")
 
@@ -1086,19 +1458,44 @@ else:
                                 "HDFCBANK", "INFY", "SBIN", "TATAMOTORS", "ITC", "ICICIBANK"],
                  key="quick", on_change=quick_cb, label_visibility="collapsed")
 
-page = st.radio("Page", [PAGE_CHART, PAGE_WL], horizontal=True, key="page", label_visibility="collapsed")
+PAGE_J, PAGE_DATA = "📒 Journal", "💾 Data & Price"
+page = st.radio("Page", [PAGE_CHART, PAGE_WL, PAGE_J, PAGE_DATA], horizontal=True, key="page",
+                label_visibility="collapsed")
+
+lv1, lv2, lv3 = st.columns([1, 1, 2])
+live = lv1.toggle("🔴 Live", key="live", help="Market chalu ho tab price aur chart apne aap chalte rehte hain.")
+secs = lv2.selectbox("Refresh", [10, 15, 30, 60], key="secs", format_func=lambda s: f"{s} sec",
+                     label_visibility="collapsed", disabled=not live, help="Chart / signal refresh. Price har 3 sec me chalta hai.")
+lv3.toggle("🤖 Auto paper-trade", key="auto",
+           help="Strong signal aane par software khud trade lock karta hai (sirf practice, asli order nahi). "
+                "Ye tabhi chalta hai jab app khula ho.")
 
 with st.expander("⚙️ Settings (capital, risk, target size)"):
-    capital = st.number_input("Capital (₹)", min_value=1000, value=100000, step=10000)
-    risk_pct = st.slider("Risk per trade (%)", 0.25, 3.0, 1.0, 0.25)
-    rr = st.slider("Reward : Risk (Target 1)", 1.0, 4.0, 2.0, 0.5,
+    capital = st.number_input("Capital (₹)", min_value=1000, step=10000, key="cap")
+    risk_pct = st.slider("Risk per trade (%)", 0.25, 3.0, step=0.25, key="risk")
+    rr = st.slider("Reward : Risk (Target 1)", 1.0, 4.0, step=0.5, key="rrr",
                    help="2.0 matlab Target 1 stop-loss se 2 guna door, Target 2 us se 3 guna door.")
     if st.button("🔄 Abhi refresh karo (cache saaf)"):
         st.cache_data.clear()
+        get_hub().data.clear()
         st.rerun()
+capital, risk_pct, rr = int(capital), float(risk_pct), float(rr)
+
+_sv = store
+if _sv.mode == "gist":
+    if _sv.error:
+        st.caption(f"⚠️ Save problem: {_sv.error}")
+    elif _sv.saved_at:
+        st.caption(f"💾 Saved ✓ {_sv.saved_at:%H:%M:%S}")
+    else:
+        st.caption("💾 Auto-save on (Gist)")
+else:
+    st.caption("⚠️ Data permanent save nahi ho raha (GITHUB_TOKEN secret nahi mila). 'Data & Price' page dekho.")
+persist(True)
+
 
 # ------------------------------------------------------------------ WATCHLIST PAGE
-if page == PAGE_WL:
+def page_watchlist():
     st.subheader("⭐ Watchlist")
     ic1, ic2 = st.columns([4, 1])
     ic1.text_input("Symbol add karo", key="wl_input", placeholder="Symbol (jaise TCS, IRCTC.NS, ^NSEI)",
@@ -1121,134 +1518,319 @@ if page == PAGE_WL:
             r = st.session_state.wl_scan.get(s)
             cur_s = "₹" if is_indian(s) else ""
             with st.container(border=True):
-                st.markdown(f"**{st.session_state.names.get(s) or s}** · `{s}`")
+                st.markdown(f"**{st.session_state.names.get(s) or s}**  ·  `{s}`")
                 if r:
                     ib = "—" if r["intra"] is None else f"{icon(r['intra'][1])} {r['intra'][0]} ({r['intra'][1]:+d})"
                     lb = "—" if r["long"] is None else f"{icon(r['long'][1])} {r['long'][0]} ({r['long'][1]:+d})"
-                    st.write(f"{cur_s}{r['price']:,.2f} ({r['chg']:+.2f}%) · ⚡ Intraday: {ib} · 📅 Long: {lb}")
+                    st.write(f"{cur_s}{r['price']:,.2f} ({r['chg']:+.2f}%)  ·  ⚡ Intraday: {ib}  ·  📅 Long: {lb}")
                 else:
                     st.caption("Scan nahi hua. Upar 'Sabka signal scan karo' dabao.")
                 b1, b2 = st.columns(2)
                 b1.button("📊 Chart kholo", key=f"open_{s}", on_click=open_symbol, args=(s,),
                           **stretch_kw(st.button))
                 b2.button("❌ Hatao", key=f"rm_{s}", on_click=wl_remove, args=(s,), **stretch_kw(st.button))
-        st.caption("💡 Watchlist is page ke link (URL) me save hoti hai. Is page ko bookmark / 'Add to Home screen' "
-                   "kar lo, to har baar wahi watchlist khulegi.")
+        st.caption("💾 Watchlist automatically save hoti hai (Gist) aur dobara waisi hi milti hai.")
     st.caption("⚠️ Sirf educational tool hai, financial advice nahi.")
+
+
+# ------------------------------------------------------------------ JOURNAL PAGE
+def trades_csv(trades):
+    cols = ["opened", "closed", "symbol", "side", "kind", "mode", "entry", "sl0", "t1", "t2", "qty", "exit_price",
+            "result", "pnl", "r_mult", "mfe", "mae", "tags"]
+    rows = [{c: (";".join(t.get(c, [])) if c == "tags" else t.get(c)) for c in cols} for t in trades]
+    return pd.DataFrame(rows, columns=cols).to_csv(index=False).encode("utf-8")
+
+
+def page_journal():
+    ss = st.session_state
+    process_trades(wait=len([t for t in ss.trades if t["status"] != "CLOSED"]) <= 4)
+    st.subheader("📒 Trade Journal")
+    st.caption("Har trade yahan note hota hai. Galat (loss) trade ka reason software khud likhta hai. "
+               "Neeche 'Claude ko dikhao' box ka text copy karke mujhe bhejo, main strategy sudhar dunga.")
+    trades = ss.trades
+    sx = tr.stats(trades)
+    if sx["n"]:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Trades", sx["n"], f"{sx['wins']}W / {sx['losses']}L")
+        c2.metric("Win rate", f"{sx['win_rate']:.0f}%")
+        c3.metric("Net P&L", f"{sx['pnl']:,.0f}")
+        c4.metric("Avg R", f"{sx['avg_r']:+.2f}")
+        if sx["mistakes"]:
+            st.markdown("**Sabse common galtiyan**")
+            st.table(pd.DataFrame([(tr.TAG_NAMES.get(k, k), v) for k, v in sx["mistakes"]],
+                                  columns=["Galti", "Kitni baar"]).set_index("Galti"))
+            top = sx["mistakes"][0]
+            if top[1] >= 2:
+                st.warning(f"⚠️ Sabse zyada galti: **{tr.TAG_NAMES.get(top[0], top[0])}** ({top[1]} baar). "
+                           "Isse bacho.")
+    else:
+        st.info("Abhi koi band trade nahi hai. Chart page par signal par '🔒 trade LOCK' karo ya Auto paper-trade on rakho.")
+
+    opens = [t for t in trades if t["status"] != "CLOSED"]
+    if opens:
+        st.markdown("#### 🟡 Chalte hue trades")
+        for t in opens:
+            cur = "₹" if is_indian(t["symbol"]) else ""
+            qd = live_quote(t["symbol"], ttl=5.0)
+            s = tr.sgn(t)
+            pnl = t["realized"] + t["qty_left"] * ((qd["price"] if qd else t["entry"]) - t["entry"]) * s
+            with st.container(border=True):
+                st.markdown(f"**{t['symbol']}** {t['side']} ({t['kind']}) · entry {cur}{t['entry']:,.2f} · "
+                            f"SL {cur}{t['sl0']:,.2f} · T1 {cur}{t['t1']:,.2f} · T2 {cur}{t['t2']:,.2f}")
+                st.caption(f"Live P&L {cur}{pnl:,.0f} · {t['status']} · {t['opened'][:16].replace('T', ' ')}")
+                st.button("🚪 Exit karo", key=f"jx_{t['id']}", on_click=manual_exit_cb, args=(t["id"],))
+
+    losses = [t for t in reversed(tr.closed_trades(trades)) if t["pnl"] < 0]
+    wins = [t for t in reversed(tr.closed_trades(trades)) if t["pnl"] >= 0]
+    st.markdown(f"#### ❌ Galat decisions ({len(losses)})")
+    for t in losses:
+        cur = "₹" if is_indian(t["symbol"]) else ""
+        with st.expander(f"❌ {t['symbol']} {t['side']} · {t['opened'][:10]} · {t['pnl']:,.0f} ({t['r_mult']:+.2f}R) · "
+                         f"{tr.RES_TEXT.get(t['result'], t['result'])}"):
+            st.write(f"Entry {cur}{t['entry']:,.2f} → Exit {cur}{t['exit_price']:,.2f} · SL {cur}{t['sl0']:,.2f} · "
+                     f"T1 {cur}{t['t1']:,.2f} · T2 {cur}{t['t2']:,.2f} · {t['bars']} candles")
+            st.markdown("**Kyun galat hua:**")
+            for w in t.get("why", []):
+                st.markdown(f"- {w}")
+            if t.get("entry_reasons"):
+                with st.container():
+                    st.caption("Entry ke waqt signal ke karan: " + " | ".join(t["entry_reasons"][:6]))
+            st.text_input("Meri note", value=t.get("note", ""), key=f"note_{t['id']}", on_change=note_cb,
+                          args=(t["id"],))
+            st.button("🗑 Hatao", key=f"del_{t['id']}", on_click=delete_trade_cb, args=(t["id"],))
+    if wins:
+        with st.expander(f"✅ Sahi trades ({len(wins)})"):
+            for t in wins:
+                st.markdown(f"✅ {t['symbol']} {t['side']} · {t['opened'][:10]} · {t['pnl']:,.0f} "
+                            f"({t['r_mult']:+.2f}R) · {tr.RES_TEXT.get(t['result'], t['result'])}")
+
+    st.markdown("#### 📝 Meri general notes")
+    st.text_area("Notes", key="notes", height=140, label_visibility="collapsed",
+                 placeholder="Apni seekh / observation yahan likho...")
+    st.markdown("#### 📤 Claude ko dikhao")
+    text = tr.summary_text(trades, ss.get("notes", ""))
+    st.code(text, language=None)
+    st.caption("Upar box ke corner me copy button hai. Copy karke chat me bhej do.")
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("⬇️ Text", text.encode("utf-8"), "journal.txt", **stretch_kw(st.download_button))
+    d2.download_button("⬇️ CSV", trades_csv(trades), "trades.csv", **stretch_kw(st.download_button))
+    d3.download_button("⬇️ JSON", json.dumps(trades, indent=1, ensure_ascii=False).encode("utf-8"), "trades.json",
+                       **stretch_kw(st.download_button))
+
+
+# ------------------------------------------------------------------ DATA & PRICE PAGE
+def page_data():
+    ss = st.session_state
+    st.subheader("💾 Data save")
+    if store.mode == "gist":
+        st.success(f"GitHub Gist se save ho raha hai. Gist id: `{(store.gist_id or 'pehli save par banegi')[:12]}`")
+        if store.error:
+            st.error(store.error)
+        if store.saved_at:
+            st.caption(f"Aakhri save: {store.saved_at:%d %b %H:%M:%S} IST")
+        st.button("💾 Abhi save karo", on_click=lambda: ss.update(_last_save=0))
+    else:
+        st.warning("Abhi data sirf is app ke temporary storage me hai (restart par ud jata hai). Permanent save ke liye:\n\n"
+                   "1. GitHub → Settings → Developer settings → Personal access tokens → **Tokens (classic)** → "
+                   "Generate new token, sirf **gist** ticked.\n"
+                   "2. Streamlit app → ⋮ → Settings → **Secrets** me likho:\n\n"
+                   "`GITHUB_TOKEN = \"ghp_xxxxxxxx\"`\n\n3. Save karke app Reboot karo.")
+    st.markdown("**Backup / Restore**")
+    st.download_button("⬇️ Poora backup (JSON)", json.dumps(collect_db(), indent=1, ensure_ascii=False).encode("utf-8"),
+                       "stock_app_backup.json")
+    st.file_uploader("Backup file chuno", type=["json"], key="restore_file")
+    if ss.get("restore_file") is not None:
+        st.button("♻️ Restore karo", on_click=restore_cb)
+    if ss.get("restore_msg"):
+        st.caption(ss.restore_msg)
+
+    st.subheader("💹 Price accuracy")
+    cfg = groww_cfg()
+    if feed.groww_configured(cfg):
+        st.success("Groww API keys mili hain: NSE stocks ka price Groww se aayega (exchange wala exact price).")
+    else:
+        st.info("Abhi price Yahoo (free) se aa raha hai - ye Groww se kuch sec/min late ya thoda alag ho sakta hai. "
+                "Bilkul Groww jaisa price chahiye to Groww Trade API (paid subscription) lo, phir Secrets me:\n\n"
+                "`GROWW_API_KEY = \"...\"`\n\n`GROWW_API_SECRET = \"...\"`")
+    sym = ss.get("symbol", "RELIANCE.NS")
+    if st.button(f"🔍 {sym} ka price test karo"):
+        r = feed.get_quote(sym, cfg, ttl=0)
+        if r:
+            st.write(f"Price **{r['price']:,.2f}** · source **{r['source']}** · "
+                     f"exchange time: {r.get('mkt_ts') or 'pata nahi'} · {r.get('note') or ''}")
+        else:
+            st.error("Price nahi mila. " + feed.groww_error())
+    if feed.groww_error():
+        st.caption(f"Groww: {feed.groww_error()}")
+    st.caption("⚠️ Sirf educational tool hai, financial advice nahi.")
+
+
+if page == PAGE_WL:
+    page_watchlist()
+    persist(True)
+    st.stop()
+if page == PAGE_J:
+    page_journal()
+    persist(True)
+    st.stop()
+if page == PAGE_DATA:
+    page_data()
+    persist(True)
     st.stop()
 
+
 # ------------------------------------------------------------------ CHART PAGE
-def chart_page(symbol, tf, overlays, pos_mode, view, capital, risk_pct, rr, secs, live, was_open):
-    """Everything below the controls. Runs as a fragment, so Live mode refreshes only this part."""
+def frag(fn, every, key):
+    """Fragment that re-runs by itself every `every` seconds (None = no timer)."""
+    if not hasattr(st, "fragment"):
+        return fn
+    try:
+        return st.fragment(run_every=every, key=key)(fn)
+    except TypeError:
+        return st.fragment(run_every=every)(fn)
+
+
+def ticker_view(symbol, cur, live, was_open):
+    """Small fragment: only the price numbers. Updates every ~3 s without touching chart / tables."""
     is_open = market_open(symbol)
     if live and is_open != was_open:
-        st.rerun()  # market just opened / closed: re-arm the refresh timer
-    now_s = time.time()
-    if is_open:
-        b_fast = int(now_s // max(int(secs), 5)) if live else int(now_s // 300)
-        b_slow = int(now_s // max(int(secs), 60)) if live else int(now_s // 300)
-    else:
-        b_fast = b_slow = int(now_s // 1800)
+        st.rerun()
+    q = live_quote(symbol, ttl=2.5, wait=True)
+    d_df, _ = hist(symbol, "1d", "5y", 120 if is_open else 1800, wait=True)
+    if q is None and d_df.empty:
+        st.error("Is symbol ka price/data nahi mila. Symbol check karo (NSE: .NS, BSE: .BO).")
+        return
+    last = d_df.iloc[-1] if not d_df.empty else None
+    price = q["price"] if q else float(last["Close"])
+    prev = (q or {}).get("prev_close")
+    if not prev and len(d_df) > 1:
+        prev = float(d_df["Close"].iloc[-2])
+    chg = price - prev if prev else 0.0
+    pct = chg / prev * 100 if prev else 0.0
+    lo = (q or {}).get("low") or (float(last["Low"]) if last is not None else price)
+    hi = (q or {}).get("high") or (float(last["High"]) if last is not None else price)
+    vol = (q or {}).get("volume") or (float(last["Volume"]) if last is not None else 0)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Price", f"{cur}{price:,.2f}", f"{chg:+.2f} ({pct:+.2f}%)")
+    m2.metric("Day Low – High", f"{cur}{lo:,.2f} – {hi:,.2f}")
+    if not d_df.empty:
+        wk = d_df.tail(252)
+        m3.metric("52W Low – High", f"{cur}{float(wk['Low'].min()):,.2f} – {float(wk['High'].max()):,.2f}")
+    m4.metric("Volume", f"{int(vol):,}")
+    now = ist_now()
+    if q:
+        src = "✅ Groww (exact)" if q.get("source") == "Groww" else "Yahoo (free)"
+        mt = q.get("mkt_ts")
+        delay = (now - mt).total_seconds() if mt else None
+        tick = f" · price {int(delay)} sec purana" if (delay is not None and is_open and delay < 600) else ""
+        state = "🟢 LIVE" if (live and is_open) else "⏸ Live band" if is_open else "⚪ Market band"
+        st.caption(f"{state} · {now:%H:%M:%S} IST · source: {src}{tick}")
+        if is_open and q.get("source") != "Groww" and delay is not None and delay > 90 and is_indian(symbol):
+            st.warning(f"Yahoo ka price ~{delay / 60:.0f} min late hai. Groww jaisa exact price ke liye "
+                       "'Data & Price' page dekho (Groww API).")
+        if q.get("note"):
+            st.caption(f"ℹ️ {q['note']}")
+    process_trades(only=symbol, q=q)
+    persist()
 
+
+def chart_page(symbol, name, tf, overlays, pos_mode, view, capital, risk_pct, rr, secs, live):
+    """Chart + signals. Runs as its own fragment; reads cached data so it is fast (no blink)."""
+    is_open = market_open(symbol)
+    now_s = time.time()
+    fast = max(int(secs), 10) if (live and is_open) else 300 if is_open else 1800
+    slow = 120 if is_open else 1800
     first = st.session_state.get("_seen") != (symbol, tf)
     with (st.spinner("Data load ho raha hai...") if first else nullcontext()):
-        d_df, stale_d = load_live(symbol, "1d", "5y", b_slow)
+        d_df, stale_d = hist(symbol, "1d", "5y", slow)
+        i_df, stale_i = hist(symbol, "5m", "1mo", fast)
         if tf == "1D":
             chart_df, stale_c = d_df, stale_d
+        elif tf == "5m":
+            chart_df, stale_c = i_df, stale_i
         else:
-            chart_df, stale_c = load_live(symbol, *TF[tf], b_fast)
-        i_df, stale_i = load_live(symbol, "5m", "5d", b_fast)
+            chart_df, stale_c = hist(symbol, *TF[tf], fast)
     st.session_state["_seen"] = (symbol, tf)
-
     if d_df.empty:
         st.error("Is symbol ka data nahi mila. Symbol check karo (NSE ke liye .NS, BSE ke liye .BO). "
                  "Naya listing hai to thoda ruk kar 'Abhi refresh karo' try karo.")
         return
-
-    name = st.session_state.names.get(symbol) or get_name(symbol)
     cur = "₹" if is_indian(symbol) else ""
-    last = d_df.iloc[-1]
-    prev = d_df.iloc[-2] if len(d_df) > 1 else last
-    price = float(last["Close"])
-    chg = price - float(prev["Close"])
-    pct = chg / float(prev["Close"]) * 100 if float(prev["Close"]) else 0.0
-    wk = d_df.tail(252)
-
-    # ---- header + live status
-    hc1, hc2 = st.columns([3, 1])
-    hc1.subheader(name)
-    hc1.caption(f"{symbol} · {len(d_df)} trading din ka data")
-    if symbol in st.session_state.wl:
-        hc2.button("❌ Watchlist se hatao", key=f"wl_btn_{symbol}", on_click=wl_remove, args=(symbol,),
-                   **stretch_kw(st.button))
-    else:
-        hc2.button("⭐ Watchlist me add", key=f"wl_btn_{symbol}", on_click=wl_add, args=(symbol,),
-                   **stretch_kw(st.button))
-
-    stamp = ist_now()
     ts = last_bar_ist(i_df if not i_df.empty else d_df)
-    age = (stamp - ts).total_seconds() / 60 if ts is not None else None
-    fresh = f"aakhri candle {ts:%d %b %H:%M} IST" if ts is not None else ""
-    if live and is_open:
-        st.caption(f"🟢 **LIVE** · {stamp:%H:%M:%S} IST · har {int(secs)} sec me auto-refresh · {fresh}")
-    elif is_open:
-        st.caption(f"⏸ Live band hai (upar toggle on karo) · {stamp:%H:%M:%S} IST · {fresh}")
-    else:
-        st.caption(f"⚪ Market abhi band hai · aakhri available data dikh raha hai · {fresh}")
-    if is_open and age is not None and age > 20 and is_indian(symbol):
-        st.warning(f"Yahoo ka data ~{age:.0f} min late hai. Free data me kabhi kabhi delay hota hai; "
-                   "asli tick-by-tick live ke liye broker API chahiye.")
+    st.caption(f"Chart/signal refresh: {ist_now():%H:%M:%S} IST · aakhri candle "
+               f"{ts:%d %b %H:%M} IST" if ts is not None else "")
     if stale_d or stale_c or stale_i:
         st.warning("Naya data nahi aa paya (Yahoo ne rok diya ho sakta hai), isliye pichhla data dikh raha hai.")
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Price", f"{cur}{price:,.2f}", f"{chg:+.2f} ({pct:+.2f}%)")
-    m2.metric("Day Low – High", f"{cur}{float(last['Low']):,.2f} – {float(last['High']):,.2f}")
-    m3.metric("52W Low – High", f"{cur}{float(wk['Low'].min()):,.2f} – {float(wk['High'].max()):,.2f}")
-    m4.metric("Volume", f"{int(last['Volume']):,}")
     if len(d_df) < 60:
         st.info("🆕 Is stock ki history bahut kam hai (naya listing). Long-term signal kam reliable hoga.")
 
-    # ---- analysis
-    daily_atr = float(true_range(d_df).ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
-    long_sig = analyze(d_df, False, CFG_LONG, daily_atr, rr, capital, risk_pct)
-    intra_sig = analyze(i_df, True, CFG_INTRA, daily_atr, rr, capital, risk_pct)
+    long_sig, intra_sig, daily_atr = get_signals(symbol, d_df, i_df, rr, capital, risk_pct)
+    maybe_auto(symbol, name, intra_sig, long_sig)
+    process_trades(only=symbol)
 
-    # ---- chart
     chart_pats = []
     chart_df = prep_chart_df(chart_df, tf)
     if chart_df is None or chart_df.empty or len(chart_df) < 2:
         st.warning(f"{tf} timeframe ka data is stock ke liye available nahi hai. Koi aur timeframe chuno.")
     else:
         chart_pats = find_patterns(chart_df)
-        chart_sig = intra_sig if tf in INTRADAY_TF else long_sig
+        kind = "intraday" if tf in INTRADAY_TF else "long"
+        chart_sig = intra_sig if kind == "intraday" else long_sig
+        now_i = tr.now_ist()
+        draw = []
+        for t in st.session_state.trades:
+            if t["symbol"] != symbol or t["kind"] != kind:
+                continue
+            if t["status"] != "CLOSED":
+                draw.append(t)
+            elif t.get("closed") and (now_i - tr.to_ts(t["closed"])) < pd.Timedelta(hours=6 if kind == "intraday" else 72):
+                draw.append(t)
         rev = f"{symbol}|{tf}|{view}|{len(chart_df) // 30}"
-        fig = build_figure(chart_df, tf, name, symbol, overlays, chart_sig, pos_mode, chart_pats, view, rev)
+        fig = build_figure(chart_df, tf, name, symbol, overlays, chart_sig, pos_mode, chart_pats, view, rev,
+                           trades_draw=draw)
         st.plotly_chart(fig, theme=None, config=PLOT_CONFIG, key=f"chart_{symbol}_{tf}",
                         **stretch_kw(st.plotly_chart))
         st.caption("👆 Ungli se drag = scroll · 2 ungli se pinch = zoom · double tap = reset. "
-                   "Position tool (Long/Short box) 1m–1h chart par Intraday signal se, 1D+ par Long Term signal se "
-                   "banta hai: 🟩 profit zone, 🟥 risk zone.")
+                   "🔒 wala box LOCKED trade hai: wo apni jagah rehta hai jab tak target / SL hit na ho. "
+                   "🟩 profit zone, 🟥 risk zone.")
         render_patterns(chart_pats, cur, tf)
 
     tab1, tab2 = st.tabs(["⚡ Intraday", "📅 Long Term"])
     with tab1:
-        st.caption("5-minute candles (last 5 din) par based. Din ke andar ka trade.")
+        st.caption("5-minute candles (completed) par based. Din ke andar ka trade.")
         render_tab(intra_sig, "intraday", daily_atr, cur,
-                   "Intraday data available nahi ya bahut kam hai (market band ya naya listing ho sakta hai).")
+                   "Intraday data available nahi ya bahut kam hai (market band ya naya listing ho sakta hai).",
+                   symbol, name)
     with tab2:
-        st.caption("Daily candles (last 5 saal tak) par based. Hafton/mahino ki position.")
+        st.caption("Daily candles (completed) par based. Hafton/mahino ki position.")
         render_tab(long_sig, "long", daily_atr, cur,
-                   "Long-term signal ke liye kam se kam 30 trading din ka data chahiye. Stock bahut naya hai.")
-
+                   "Long-term signal ke liye kam se kam 30 trading din ka data chahiye. Stock bahut naya hai.",
+                   symbol, name)
     st.caption("⚠️ Sirf educational tool hai, financial advice nahi. Pehle paper trading me test karo.")
+    persist()
 
 
 symbol = st.session_state.symbol
 try:
     st.query_params["s"] = symbol
+    _sync_url()
 except Exception:
     pass
+name = st.session_state.names.get(symbol) or get_name(symbol)
+cur0 = "₹" if is_indian(symbol) else ""
+
+hc1, hc2 = st.columns([3, 1])
+hc1.subheader(name)
+hc1.caption(symbol)
+if symbol in st.session_state.wl:
+    hc2.button("❌ Watchlist se hatao", key=f"wl_btn_{symbol}", on_click=wl_remove, args=(symbol,),
+               **stretch_kw(st.button))
+else:
+    hc2.button("⭐ Watchlist me add", key=f"wl_btn_{symbol}", on_click=wl_add, args=(symbol,),
+               **stretch_kw(st.button))
+
+open_now = market_open(symbol)
+frag(ticker_view, 3 if (live and open_now) else None, "ticker")(symbol, cur0, live, open_now)
 
 tf = st.radio("Timeframe", list(TF.keys()), index=5, horizontal=True, label_visibility="collapsed")
 oc1, oc2, oc3 = st.columns([3, 1, 1])
@@ -1258,25 +1840,10 @@ overlays = oc1.multiselect(
     default=["EMA 20/50", "Volume", "Support/Resistance", "Position tool", "Chart patterns"],
 )
 pos_mode = oc2.selectbox("Position tool", ["Auto", "Long", "Short", "Off"],
-                         help="Auto = strategy ke signal ke hisaab se Long ya Short. Long/Short = jo chaho wo dikhao.")
+                         help="Auto = signal ke hisaab se. Locked trade hamesha apni jagah dikhta hai.")
 view = oc3.selectbox("Chart view", ["50", "110", "250", "Sab"], index=1,
                      help="Chart shuru me kitni candles dikhaye. Baad me ungli se zoom/scroll kar sakte ho.")
 
-lv1, lv2, lv3 = st.columns([1, 1, 2])
-live = lv1.toggle("🔴 Live", value=True,
-                  help="Market chalu ho tab chart aur price apne aap refresh hote rehte hain.")
-secs = lv2.selectbox("Refresh", [10, 15, 30, 60], index=2, format_func=lambda s: f"{s} sec",
-                     label_visibility="collapsed", disabled=not live)
-lv3.caption("Free Yahoo data: kuch minute late ho sakta hai.")
-
-open_now = market_open(symbol)
-chart_args = (symbol, tf, overlays, pos_mode, view, capital, risk_pct, rr, secs, live, open_now)
-if live and hasattr(st, "fragment"):
-    every = int(secs) if open_now else 300
-    try:
-        runner = st.fragment(run_every=every, key="live_chart")
-    except TypeError:  # older Streamlit without the `key` argument
-        runner = st.fragment(run_every=every)
-    runner(chart_page)(*chart_args)
-else:
-    chart_page(*chart_args)
+every = int(secs) if (live and open_now) else (300 if open_now else None)
+frag(chart_page, every, "live_chart")(symbol, name, tf, overlays, pos_mode, view, capital, risk_pct, rr, secs, live)
+persist(True)
